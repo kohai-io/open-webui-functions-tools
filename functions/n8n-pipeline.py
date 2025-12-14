@@ -153,7 +153,7 @@ class Pipe:
         )
 
     def __init__(self):
-        self.name = "ITV Procurement Agent"
+        self.name = "N8N Conversational Agent"
         self.valves = self.Valves()
         self.last_emit_time = 0
         self.log = logging.getLogger("n8n_pipeline")

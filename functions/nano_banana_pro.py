@@ -588,7 +588,7 @@ class Pipe:
             "claim_generator": "OpenWebUI/NanoBananaPro",
             "claim_generator_info": [
                 {
-                    "name": "ITV Agent Hub - Gemini 3 Pro Image Pipeline",
+                    "name": "Open Web UI - Gemini 3 Pro Image Pipeline",
                     "version": "3.1"
                 }
             ],
