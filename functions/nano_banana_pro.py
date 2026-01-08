@@ -2,7 +2,7 @@
 title: Google Gemini 3 Pro Image Generation (Chat Pipe)
 author: open-webui
 date: 2025-12-11
-version: 3.5
+version: 3.78
 license: MIT
 description: A pipe for professional image generation using Google Gemini 3 Pro Image with high-resolution output (1K/2K/4K) and up to 14 reference images. Aspect ratio and resolution settings are sticky across conversation.
 requirements: google-genai>=1.50.0, cryptography, requests, google-auth, c2pa-python
@@ -20,6 +20,8 @@ import io
 from datetime import datetime
 from typing import Optional, Any, List, Dict, Union, Callable, Awaitable
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from pydantic_core import core_schema
 
@@ -235,13 +237,21 @@ class Pipe:
             default="",
             description="Path to C2PA private key (.pem file). Alternative to C2PA_KEY_CONTENT.",
         )
-        C2PA_TSA_URL: str = Field(
+        C2PA_KEY_PASSWORD: EncryptedStr = Field(
             default="",
-            description="Timestamp Authority URL for C2PA signing (optional but recommended for production).",
+            description="Password for encrypted private key (optional). Will be encrypted for security. Leave empty if key is not password-protected.",
+        )
+        C2PA_TSA_URL: str = Field(
+            default="http://timestamp.digicert.com",
+            description="Timestamp Authority URL for C2PA signing. Uses DigiCert's free public TSA by default. Set to a different URL if you have a preferred TSA.",
         )
         C2PA_TRAINING_POLICY: str = Field(
             default="notAllowed",
             description="AI training policy for generated images: 'allowed', 'notAllowed', or 'constrained'. Controls c2pa.training-mining assertion.",
+        )
+        C2PA_SIGNING_ALGORITHM: str = Field(
+            default="PS256",
+            description="C2PA signing algorithm. Supported: 'ES256' (ECDSA P-256), 'ES384' (ECDSA P-384), 'ES512' (ECDSA P-521), 'PS256' (RSA-PSS-SHA256), 'PS384' (RSA-PSS-SHA384), 'PS512' (RSA-PSS-SHA512), 'ED25519' (EdDSA). Use PS256/PS384/PS512 for RSA 2048+ keys, ES256/ES384/ES512 for EC keys.",
         )
 
     def __init__(self):
@@ -687,7 +697,25 @@ class Pipe:
             # Get certificate and key as bytes (content takes precedence)
             if self.valves.C2PA_CERT_CONTENT:
                 cert_data = self.valves.C2PA_CERT_CONTENT.get_decrypted().encode('utf-8')
-                self._debug("Using C2PA certificate from content (encrypted)")
+                cert_count = cert_data.count(b'-----BEGIN CERTIFICATE-----')
+                self._debug(f"Using C2PA certificate from content (encrypted) - {cert_count} cert blocks found")
+                
+                # Debug: show structure of certificate chain
+                certs_split = cert_data.split(b'-----BEGIN CERTIFICATE-----')
+                for i, cert_block in enumerate(certs_split[1:], 1):  # Skip empty first element
+                    # Get first non-empty line after BEGIN marker
+                    lines = [line.strip() for line in cert_block.split(b'\n') if line.strip()]
+                    if lines:
+                        first_data = lines[0][:60] if lines[0] != b'-----END CERTIFICATE-----' else b'<empty cert>'
+                        self._debug(f"Cert {i} first data: {first_data}")
+                    else:
+                        self._debug(f"Cert {i}: NO DATA FOUND - malformed PEM")
+                
+                # Validate PEM format
+                if b'-----END CERTIFICATE-----' not in cert_data:
+                    self._debug("WARNING: No END CERTIFICATE marker found - invalid PEM")
+                if cert_data.count(b'-----BEGIN CERTIFICATE-----') != cert_data.count(b'-----END CERTIFICATE-----'):
+                    self._debug("WARNING: BEGIN/END certificate markers don't match")
             else:
                 cert_path = self.valves.C2PA_CERT_PATH
                 if not os.path.exists(cert_path):
@@ -695,10 +723,12 @@ class Pipe:
                     return image_data
                 with open(cert_path, "rb") as f:
                     cert_data = f.read()
-                self._debug(f"Using C2PA certificate from path: {cert_path}")
+                cert_count = cert_data.count(b'-----BEGIN CERTIFICATE-----')
+                self._debug(f"Using C2PA certificate from path: {cert_path} - {cert_count} cert blocks found")
             
+            # Get private key data (content takes precedence)
             if self.valves.C2PA_KEY_CONTENT:
-                key_data = self.valves.C2PA_KEY_CONTENT.get_decrypted().encode('utf-8')
+                key_pem_data = self.valves.C2PA_KEY_CONTENT.get_decrypted().encode('utf-8')
                 self._debug("Using C2PA private key from content (encrypted)")
             else:
                 key_path = self.valves.C2PA_KEY_PATH
@@ -706,29 +736,91 @@ class Pipe:
                     self._debug(f"C2PA private key not found: {key_path}")
                     return image_data
                 with open(key_path, "rb") as f:
-                    key_data = f.read()
+                    key_pem_data = f.read()
                 self._debug(f"Using C2PA private key from path: {key_path}")
+            
+            # Handle password-protected keys
+            key_password = None
+            if self.valves.C2PA_KEY_PASSWORD:
+                key_password_str = self.valves.C2PA_KEY_PASSWORD.get_decrypted()
+                if key_password_str:
+                    key_password = key_password_str.encode('utf-8')
+                    self._debug("Private key password provided - will decrypt")
+            
+            # Try to load and decrypt the key if password-protected
+            # The C2PA library needs the raw decrypted key bytes
+            try:
+                private_key_obj = serialization.load_pem_private_key(
+                    key_pem_data,
+                    password=key_password,
+                    backend=default_backend()
+                )
+                
+                # Re-serialize to unencrypted PEM for C2PA library
+                key_data = private_key_obj.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                self._debug("Successfully decrypted private key")
+            except TypeError:
+                # Key wasn't encrypted, use as-is
+                key_data = key_pem_data
+                self._debug("Private key not encrypted - using as-is")
+            except Exception as key_err:
+                self._debug(f"Failed to decrypt private key: {key_err}")
+                return image_data
             
             # Create manifest JSON
             manifest = self._create_c2pa_manifest(prompt, user)
             manifest_json = json.dumps(manifest)
             
             # Create signer info using the current API (v0.27.1)
-            # Build kwargs conditionally - only include ta_url if configured
-            signer_kwargs = {
-                "alg": C2paSigningAlg.ES256,  # Elliptic Curve (most common for ES256 keys)
-                "sign_cert": cert_data,
-                "private_key": key_data,
+            # Determine signing algorithm based on configuration
+            # Note: c2pa-python only supports ES256/384/512, PS256/384/512, ED25519
+            # RS256 is NOT supported - use PS256 for RSA keys instead
+            alg_map = {
+                "ES256": C2paSigningAlg.ES256,  # ECDSA P-256
+                "ES384": C2paSigningAlg.ES384,  # ECDSA P-384
+                "ES512": C2paSigningAlg.ES512,  # ECDSA P-521
+                "PS256": C2paSigningAlg.PS256,  # RSA-PSS SHA-256 (for RSA 2048+)
+                "PS384": C2paSigningAlg.PS384,  # RSA-PSS SHA-384 (for RSA 3072+)
+                "PS512": C2paSigningAlg.PS512,  # RSA-PSS SHA-512 (for RSA 4096+)
+                "ED25519": C2paSigningAlg.ED25519,  # EdDSA
             }
             
-            # Add timestamp authority only if configured (optional parameter)
-            if self.valves.C2PA_TSA_URL:
-                signer_kwargs["ta_url"] = self.valves.C2PA_TSA_URL
-                self._debug(f"Using TSA: {self.valves.C2PA_TSA_URL}")
+            alg_name = self.valves.C2PA_SIGNING_ALGORITHM.upper()
+            if alg_name not in alg_map:
+                self._debug(f"Invalid C2PA algorithm '{alg_name}', defaulting to ES256")
+                alg_name = "ES256"
+            
+            signing_alg = alg_map[alg_name]
+            self._debug(f"Using C2PA signing algorithm: {alg_name}")
+            
+            # Build signer info - use empty string for ta_url if not configured
+            ta_url = self.valves.C2PA_TSA_URL if self.valves.C2PA_TSA_URL else ""
+            
+            if ta_url:
+                self._debug(f"Using TSA: {ta_url}")
             else:
                 self._debug("No TSA configured - signing without timestamp")
             
-            signer_info = C2paSignerInfo(**signer_kwargs)
+            # Debug: dump certificate data hash for verification
+            import hashlib
+            cert_hash = hashlib.sha256(cert_data).hexdigest()
+            self._debug(f"Certificate data SHA256: {cert_hash}")
+            self._debug(f"Certificate data length: {len(cert_data)} bytes")
+            
+            # Debug: show first/last 100 bytes of cert data
+            self._debug(f"Cert data starts: {cert_data[:100]}")
+            self._debug(f"Cert data ends: {cert_data[-100:]}")
+            
+            signer_info = C2paSignerInfo(
+                alg=signing_alg,
+                sign_cert=cert_data,
+                private_key=key_data,
+                ta_url=ta_url
+            )
             signer = C2paSigner.from_info(signer_info)
             
             # Sign the image using Builder context manager
