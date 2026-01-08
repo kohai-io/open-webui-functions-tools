@@ -2,7 +2,7 @@
 title: Google Gemini 3 Pro Image Generation (Chat Pipe)
 author: open-webui
 date: 2025-12-11
-version: 3.78
+version: 3.8
 license: MIT
 description: A pipe for professional image generation using Google Gemini 3 Pro Image with high-resolution output (1K/2K/4K) and up to 14 reference images. Aspect ratio and resolution settings are sticky across conversation.
 requirements: google-genai>=1.50.0, cryptography, requests, google-auth, c2pa-python
@@ -315,6 +315,46 @@ class Pipe:
     def _debug(self, msg: str) -> None:
         if getattr(self.valves, "debug", False):
             print(f"[DEBUG] {msg}")
+
+    def _detect_edit_mode_from_prompt(self, prompt: str) -> bool:
+        """Detect if user wants edit mode from their prompt.
+        
+        Looks for edit-specific keywords that indicate the user wants to modify
+        an existing image rather than generate with multiple reference images.
+        
+        Returns:
+            True if edit keywords detected, False otherwise
+        """
+        if not prompt or not isinstance(prompt, str):
+            return False
+        
+        prompt_lower = prompt.lower()
+        
+        # Strong edit signals from context menu prompts
+        edit_keywords = [
+            "edit this image:",
+            "edit the image:",
+            "modify this image:",
+            "modify the image:",
+            "change this image:",
+            "change the image:",
+            # Specific edit operations
+            "remove the", "remove this",
+            "replace the", "replace this",
+            "change the color",
+            "enhance the quality", "enhance this image",
+            "improve the quality", "improve this image",
+            # User-typed edit phrases
+            "edit:", "modify:", "change:",
+            "make it", "make this", "make the"
+        ]
+        
+        detected = any(kw in prompt_lower for kw in edit_keywords)
+        
+        if detected:
+            self._debug(f"Edit mode AUTO-DETECTED from prompt keywords")
+        
+        return detected
 
     async def emit_status(
         self,
@@ -980,13 +1020,16 @@ class Pipe:
                     body["messages"].append({"role": "assistant", "content": error_msg})
                     return body
 
+            # Detect if edit mode should be enabled based on prompt
+            prompt_requests_edit = self._detect_edit_mode_from_prompt(prompt)
+            
             # Build Gemini content with conversation history
             await self.emit_status(
                 __event_emitter__,
                 "info",
                 "Building context from conversation history...",
             )
-            contents = self._build_gemini_context(messages, prompt, __request__)
+            contents = self._build_gemini_context(messages, prompt, __request__, prompt_requests_edit)
 
             # Generate with Gemini - create client based on authentication mode
             if self.valves.use_vertex_ai:
@@ -1809,14 +1852,27 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
             self._debug(f"Error scanning history for sticky settings: {e}")
             return "", ""
 
+    def _is_edit_mode_prompt(self, text: str) -> bool:
+        """Detect if the prompt contains edit mode keywords."""
+        edit_keywords = ["edit", "modify", "change", "update", "adjust"]
+        text = text.lower()
+        for keyword in edit_keywords:
+            if keyword in text:
+                return True
+        return False
+
     def _build_gemini_context(
-        self, messages: List[Dict], current_prompt: str, request: Optional[Any] = None
+        self, messages: List[Dict], current_prompt: str, request: Any, prompt_requests_edit: bool = False
     ) -> List[types.Content]:
-        """Build Gemini content array with conversation history and images.
+        """Build the Gemini content list from conversation history.
 
         Strategy:
-        - In iterative mode, we select the most recent images from history (assistant or user images)
-          up to max_history_images and include them together with the current prompt in a single
+        - If enable_iterative is False, we just send current_prompt.
+        - If enable_iterative is True:
+          - We scan message history backwards, collecting image URLs.
+          - edit_mode=True: collect max 1 recent image (for consistent edits)
+          - edit_mode=False: collect up to max_history_images (for multi-reference)
+          - If edit_mode is on and edit_guidance is set, prepend that text to the
           user message. This generally yields better image edit behavior.
         - In simple mode, we just send the current prompt.
         """
@@ -1833,13 +1889,20 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
 
         # Gather image URLs from history, most recent first
         collected_images: List[Dict[str, bytes]] = []
+        # Determine if we should use edit mode:
+        # - Valve setting (self.valves.edit_mode) OR
+        # - Auto-detected from prompt (prompt_requests_edit)
+        use_edit_mode = self.valves.edit_mode or prompt_requests_edit
+
         # edit_mode=True: Use only 1 most recent image for consistent editing behavior
         # edit_mode=False: Use up to max_history_images for Gemini 3 Pro's multi-reference capability
         max_images = (
-            1 if self.valves.edit_mode else max(0, int(self.valves.max_history_images))
+            1 if use_edit_mode else max(0, int(self.valves.max_history_images))
         )
+
+        edit_mode_source = "valve" if self.valves.edit_mode else ("auto-detected" if prompt_requests_edit else "disabled")
         self._debug(
-            f"Image collection: edit_mode={self.valves.edit_mode}, max_images={max_images}"
+            f"Image collection: edit_mode={use_edit_mode} ({edit_mode_source}), max_images={max_images}"
         )
 
         def try_add_image(url: str):
@@ -1876,8 +1939,11 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
 
         # Build a single user content with optional guidance + selected images + current prompt
         parts: List[types.Part] = []
+        # Only prepend edit_guidance if valve-based edit_mode is enabled
+        # (not for auto-detected edit mode, as the prompt already has edit instructions)
         if self.valves.edit_mode and self.valves.edit_guidance:
             parts.append(types.Part.from_text(text=self.valves.edit_guidance))
+            self._debug("Prepended edit_guidance to prompt")
         self._debug(
             f"Collected {len(collected_images)} prior image(s) for context (max={max_images})"
         )
