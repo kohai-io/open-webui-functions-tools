@@ -1,7 +1,7 @@
 """
 title: Interactive User Dashboard
 author: open-webui
-version: 2.1.18
+version: 2.1.27
 description: Interactive dashboard with rich UI embedding. Shows user statistics with live charts and visualizations. Admins see system-wide metrics, users see personal stats. Enhanced model tracking focused on admin-relevant insights.
 required_open_webui_version: 0.3.9
 requirements: cryptography
@@ -117,66 +117,91 @@ class Tools:
         if sum(data) == 0:
             return f'<div style="height: {height}px; display: flex; align-items: center; justify-content: center; color: var(--text-muted);">No data</div>'
         
-        # Build JavaScript arrays manually (like distribution chart does) to avoid f-string issues
-        labels_js = '[' + ','.join(f"'{str(label).replace(chr(39), chr(92)+chr(39))}'" for label in labels) + ']'
-        data_js = '[' + ','.join(str(d) for d in data) + ']'
-        colors_js = '[' + ','.join(f"'{c}'" for c in colors) + ']'
+        # Use base64 encoding to avoid any HTML/markdown processing issues
+        import base64
+        labels_json = json.dumps([str(label) for label in labels])
+        data_json = json.dumps(data)
+        colors_json = json.dumps(colors)
+        
+        # Base64 encode to completely avoid any transformation
+        labels_b64 = base64.b64encode(labels_json.encode()).decode()
+        data_b64 = base64.b64encode(data_json.encode()).decode()
+        colors_b64 = base64.b64encode(colors_json.encode()).decode()
         
         return f'''
-            <div id="container_{chart_id}" style="max-height: {height}px;"></div>
+            <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
+                 data-labels="{labels_b64}"
+                 data-values="{data_b64}"
+                 data-colors="{colors_b64}"></div>
             <script>
                 (function() {{
-                    const container = document.getElementById('container_{chart_id}');
-                    const canvas = document.createElement('canvas');
-                    canvas.id = '{chart_id}';
-                    container.appendChild(canvas);
-                    
-                    const chartLabels = {labels_js};
-                    const chartData = {data_js};
-                    const chartColors = {colors_js};
-                    
-                    new Chart(canvas, {{
-                        type: 'doughnut',
-                        data: {{
-                            labels: chartLabels,
-                            datasets: [{{
-                                data: chartData,
-                                backgroundColor: chartColors,
-                                borderWidth: 2,
-                                borderColor: 'rgba(255, 255, 255, 0.2)'
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: true,
-                            plugins: {{
-                                legend: {{
-                                    position: 'bottom',
-                                    labels: {{
-                                        color: '#8b94b8',
-                                        padding: 15,
-                                        font: {{
-                                            size: 13
+                    try {{
+                        const container = document.getElementById('container_{chart_id}');
+                        
+                        // Decode base64 data attributes
+                        const labelsB64 = container.dataset.labels;
+                        const valuesB64 = container.dataset.values;
+                        const colorsB64 = container.dataset.colors;
+                        
+                        console.log('=== DONUT DEBUG ===');
+                        console.log('base64 values:', valuesB64);
+                        
+                        const canvas = document.createElement('canvas');
+                        canvas.id = '{chart_id}';
+                        container.appendChild(canvas);
+                        
+                        // Decode base64 and parse JSON
+                        const chartLabels = JSON.parse(atob(labelsB64));
+                        const chartData = JSON.parse(atob(valuesB64));
+                        const chartColors = JSON.parse(atob(colorsB64));
+                        
+                        console.log('chartData decoded:', chartData);
+                        
+                        new Chart(canvas, {{
+                            type: 'doughnut',
+                            data: {{
+                                labels: chartLabels,
+                                datasets: [{{
+                                    data: chartData,
+                                    backgroundColor: chartColors,
+                                    borderWidth: 2,
+                                    borderColor: 'rgba(255, 255, 255, 0.2)'
+                                }}]
+                            }},
+                            options: {{
+                                responsive: true,
+                                maintainAspectRatio: true,
+                                plugins: {{
+                                    legend: {{
+                                        position: 'bottom',
+                                        labels: {{
+                                            color: '#8b94b8',
+                                            padding: 15,
+                                            font: {{
+                                                size: 13
+                                            }}
                                         }}
-                                    }}
-                                }},
-                                tooltip: {{
-                                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-                                    padding: 12,
-                                    cornerRadius: 8,
-                                    callbacks: {{
-                                        label: function(context) {{
-                                            const label = context.label || '';
-                                            const value = context.parsed;
-                                            const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                                            const percentage = ((value / total) * 100).toFixed(1);
-                                            return label + ': ' + value + ' (' + percentage + '%)';
+                                    }},
+                                    tooltip: {{
+                                        backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                        padding: 12,
+                                        cornerRadius: 8,
+                                        callbacks: {{
+                                            label: function(context) {{
+                                                const label = context.label || '';
+                                                const value = context.parsed;
+                                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
+                                                const percentage = ((value / total) * 100).toFixed(1);
+                                                return label + ': ' + value + ' (' + percentage + '%)';
+                                            }}
                                         }}
                                     }}
                                 }}
                             }}
-                        }}
-                    }});
+                        }});
+                    }} catch(e) {{
+                        console.error('Donut chart error:', e);
+                    }}
                 }})();
             </script>
         '''
@@ -195,67 +220,76 @@ class Tools:
         else:
             colors_list = [colors] * len(data)
         
+        # Use base64 encoding to avoid any HTML/markdown processing issues
+        import base64
+        labels_json = json.dumps([str(label) for label in labels])
+        data_json = json.dumps(data)
+        colors_json = json.dumps(colors_list)
+        
+        # Base64 encode to completely avoid any transformation
+        labels_b64 = base64.b64encode(labels_json.encode()).decode()
+        data_b64 = base64.b64encode(data_json.encode()).decode()
+        colors_b64 = base64.b64encode(colors_json.encode()).decode()
+        
         return f'''
-            <div id="container_{chart_id}" style="max-height: {height}px;"></div>
+            <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
+                 data-labels="{labels_b64}"
+                 data-values="{data_b64}"
+                 data-colors="{colors_b64}"></div>
             <script>
                 (function() {{
-                    const container = document.getElementById('container_{chart_id}');
-                    const canvas = document.createElement('canvas');
-                    canvas.id = '{chart_id}';
-                    container.appendChild(canvas);
-                    
-                    new Chart(canvas, {{
-                        type: 'bar',
-                        data: {{
-                            labels: {labels},
-                            datasets: [{{
-                                data: {data},
-                                backgroundColor: {colors_list},
-                                borderRadius: 6,
-                                borderSkipped: false
-                            }}]
-                        }},
-                        options: {{
-                            responsive: true,
-                            maintainAspectRatio: true,
-                            plugins: {{
-                                legend: {{
-                                    display: false
-                                }},
-                                tooltip: {{
-                                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-                                    padding: 12,
-                                    cornerRadius: 8
-                                }}
+                    try {{
+                        const container = document.getElementById('container_{chart_id}');
+                        const canvas = document.createElement('canvas');
+                        canvas.id = '{chart_id}';
+                        container.appendChild(canvas);
+                        
+                        // Decode base64 and parse JSON
+                        const chartLabels = JSON.parse(atob(container.dataset.labels));
+                        const chartData = JSON.parse(atob(container.dataset.values));
+                        const chartColors = JSON.parse(atob(container.dataset.colors));
+                        
+                        console.log('=== BAR CHART DEBUG ({chart_id}) ===');
+                        console.log('chartData:', chartData);
+                        
+                        new Chart(canvas, {{
+                            type: 'bar',
+                            data: {{
+                                labels: chartLabels,
+                                datasets: [{{
+                                    data: chartData,
+                                    backgroundColor: chartColors,
+                                    borderRadius: 6,
+                                    borderSkipped: false
+                                }}]
                             }},
-                            scales: {{
-                                y: {{
-                                    beginAtZero: true,
-                                    grid: {{
-                                        color: 'rgba(139, 148, 184, 0.1)',
-                                        drawBorder: false
-                                    }},
-                                    ticks: {{
-                                        color: '#8b94b8',
-                                        font: {{
-                                            size: 11
-                                        }}
+                            options: {{
+                                responsive: true,
+                                maintainAspectRatio: true,
+                                plugins: {{
+                                    legend: {{ display: false }},
+                                    tooltip: {{
+                                        backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                        padding: 12,
+                                        cornerRadius: 8
                                     }}
                                 }},
-                                x: {{
-                                    grid: {{
-                                        display: false
+                                scales: {{
+                                    y: {{
+                                        beginAtZero: true,
+                                        grid: {{ color: 'rgba(139, 148, 184, 0.1)', drawBorder: false }},
+                                        ticks: {{ color: '#8b94b8', font: {{ size: 11 }} }}
                                     }},
-                                    ticks: {{
-                                        color: '#8b94b8',
-                                        font: {{
-                                            size: 12
-                                        }}
+                                    x: {{
+                                        grid: {{ display: false }},
+                                        ticks: {{ color: '#8b94b8', font: {{ size: 12 }} }}
                                     }}
                                 }}
                             }}
-                        }}
-                    }});
+                        }});
+                    }} catch(e) {{
+                        console.error('Bar chart error:', e);
+                    }}
                 }})();
             </script>
         '''
@@ -268,80 +302,40 @@ class Tools:
         if not data or max(data) == 0:
             return f'<div style="height: {height}px; display: flex; align-items: center; justify-content: center; color: var(--text-muted);">No data</div>'
         
+        labels_json = json.dumps([str(label) for label in labels])
+        data_json = json.dumps(data)
+        labels_b64 = base64.b64encode(labels_json.encode()).decode()
+        data_b64 = base64.b64encode(data_json.encode()).decode()
+        
         return f'''
-            <div id="container_{chart_id}" style="max-height: {height}px;"></div>
+            <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
+                 data-labels="{labels_b64}" data-values="{data_b64}" data-color="{color}"></div>
             <script>
                 (function() {{
-                    const container = document.getElementById('container_{chart_id}');
-                    const canvas = document.createElement('canvas');
-                    canvas.id = '{chart_id}';
-                    container.appendChild(canvas);
-                    
-                    new Chart(canvas, {{
-                        type: 'bar',
-                        data: {{
-                            labels: {labels},
-                            datasets: [{{
-                                data: {data},
-                                backgroundColor: '{color}',
-                                borderRadius: 6,
-                                borderSkipped: false
-                            }}]
-                        }},
-                        options: {{
-                            indexAxis: 'y',
-                            responsive: true,
-                            maintainAspectRatio: false,
-                            plugins: {{
-                                legend: {{
-                                    display: false
-                                }},
-                                tooltip: {{
-                                    backgroundColor: 'rgba(0, 0, 0, 0.8)',
-                                    padding: 12,
-                                    cornerRadius: 8,
-                                    callbacks: {{
-                                        label: function(context) {{
-                                            return context.parsed.x.toLocaleString();
-                                        }}
-                                    }}
-                                }}
-                            }},
-                            scales: {{
-                                x: {{
-                                    beginAtZero: true,
-                                    grid: {{
-                                        color: 'rgba(139, 148, 184, 0.1)',
-                                        drawBorder: false
-                                    }},
-                                    ticks: {{
-                                        color: '#8b94b8',
-                                        font: {{
-                                            size: 11
-                                        }}
-                                    }}
-                                }},
-                                y: {{
-                                    grid: {{
-                                        display: false
-                                    }},
-                                    ticks: {{
-                                        color: '#8b94b8',
-                                        font: {{
-                                            size: 12
-                                        }},
-                                        crossAlign: 'far'
-                                    }}
-                                }}
+                    try {{
+                        const container = document.getElementById('container_{chart_id}');
+                        const canvas = document.createElement('canvas');
+                        canvas.id = '{chart_id}';
+                        container.appendChild(canvas);
+                        const chartLabels = JSON.parse(atob(container.dataset.labels));
+                        const chartData = JSON.parse(atob(container.dataset.values));
+                        const chartColor = container.dataset.color;
+                        new Chart(canvas, {{
+                            type: 'bar',
+                            data: {{ labels: chartLabels, datasets: [{{ data: chartData, backgroundColor: chartColor, borderRadius: 6, borderSkipped: false }}] }},
+                            options: {{
+                                indexAxis: 'y', responsive: true, maintainAspectRatio: false,
+                                plugins: {{ legend: {{ display: false }}, tooltip: {{ backgroundColor: 'rgba(0,0,0,0.8)', padding: 12, cornerRadius: 8, callbacks: {{ label: function(c) {{ return c.parsed.x.toLocaleString(); }} }} }} }},
+                                scales: {{ x: {{ beginAtZero: true, grid: {{ color: 'rgba(139,148,184,0.1)', drawBorder: false }}, ticks: {{ color: '#8b94b8', font: {{ size: 11 }} }} }}, y: {{ grid: {{ display: false }}, ticks: {{ color: '#8b94b8', font: {{ size: 12 }}, crossAlign: 'far' }} }} }}
                             }}
-                        }}
-                    }});
+                        }});
+                    }} catch(e) {{ console.error('Horizontal bar chart error:', e); }}
                 }})();
             </script>
         '''
 
     def _create_distribution_chart(self, title: str, labels: list, data: list, colors: list, percentiles: dict, top_10_share: float, width: int = 600, height: int = 200) -> str:
-        """Generate 100% stacked bar chart for percentile distributions - perfect for showing proportional breakdown"""
+        """Generate 100% stacked bar chart for percentile distributions"""
         import random
         chart_id = f"chart_{random.randint(10000, 99999)}"
         
@@ -1906,7 +1900,7 @@ class Tools:
     
     <div class="container">
         <div class="header">
-            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.18</span></h1>
+            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.27</span></h1>
             <p><strong>Administrator:</strong> {admin_name} | <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
 
