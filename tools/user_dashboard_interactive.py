@@ -1,7 +1,7 @@
 """
 title: Interactive User Dashboard
 author: open-webui
-version: 2.1.27
+version: 2.1.43
 description: Interactive dashboard with rich UI embedding. Shows user statistics with live charts and visualizations. Admins see system-wide metrics, users see personal stats. Enhanced model tracking focused on admin-relevant insights.
 required_open_webui_version: 0.3.9
 requirements: cryptography
@@ -109,7 +109,7 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
 
-    def _create_donut_chart_svg(self, labels: list, data: list, colors: list, width: int = 400, height: int = 400) -> str:
+    def _create_donut_chart_svg(self, labels: list, data: list, colors: list, width: int = 220, height: int = 220) -> str:
         """Generate Chart.js doughnut chart"""
         import random
         chart_id = f"chart_{random.randint(10000, 99999)}"
@@ -129,7 +129,7 @@ class Tools:
         colors_b64 = base64.b64encode(colors_json.encode()).decode()
         
         return f'''
-            <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
+            <div id="container_{chart_id}" style="height: {height}px; max-height: {height}px; display: flex; justify-content: center; align-items: center;"
                  data-labels="{labels_b64}"
                  data-values="{data_b64}"
                  data-colors="{colors_b64}"></div>
@@ -137,76 +137,40 @@ class Tools:
                 (function() {{
                     try {{
                         const container = document.getElementById('container_{chart_id}');
-                        
-                        // Decode base64 data attributes
                         const labelsB64 = container.dataset.labels;
                         const valuesB64 = container.dataset.values;
                         const colorsB64 = container.dataset.colors;
-                        
-                        console.log('=== DONUT DEBUG ===');
-                        console.log('base64 values:', valuesB64);
-                        
                         const canvas = document.createElement('canvas');
                         canvas.id = '{chart_id}';
+                        canvas.style.maxWidth = '200px';
+                        canvas.style.maxHeight = '200px';
                         container.appendChild(canvas);
-                        
-                        // Decode base64 and parse JSON
                         const chartLabels = JSON.parse(atob(labelsB64));
                         const chartData = JSON.parse(atob(valuesB64));
                         const chartColors = JSON.parse(atob(colorsB64));
-                        
-                        console.log('chartData decoded:', chartData);
-                        
                         new Chart(canvas, {{
                             type: 'doughnut',
                             data: {{
                                 labels: chartLabels,
-                                datasets: [{{
-                                    data: chartData,
-                                    backgroundColor: chartColors,
-                                    borderWidth: 2,
-                                    borderColor: 'rgba(255, 255, 255, 0.2)'
-                                }}]
+                                datasets: [{{ data: chartData, backgroundColor: chartColors, borderWidth: 2, borderColor: 'rgba(255, 255, 255, 0.2)' }}]
                             }},
                             options: {{
                                 responsive: true,
-                                maintainAspectRatio: true,
                                 plugins: {{
                                     legend: {{
                                         position: 'bottom',
-                                        labels: {{
-                                            color: '#8b94b8',
-                                            padding: 15,
-                                            font: {{
-                                                size: 13
-                                            }}
-                                        }}
+                                        align: 'center'
                                     }},
-                                    tooltip: {{
-                                        backgroundColor: 'rgba(0, 0, 0, 0.8)',
-                                        padding: 12,
-                                        cornerRadius: 8,
-                                        callbacks: {{
-                                            label: function(context) {{
-                                                const label = context.label || '';
-                                                const value = context.parsed;
-                                                const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                                                const percentage = ((value / total) * 100).toFixed(1);
-                                                return label + ': ' + value + ' (' + percentage + '%)';
-                                            }}
-                                        }}
-                                    }}
+                                    tooltip: {{ enabled: true, backgroundColor: 'rgba(0, 0, 0, 0.8)', titleColor: '#fff', bodyColor: '#fff', padding: 12, cornerRadius: 8 }}
                                 }}
                             }}
                         }});
-                    }} catch(e) {{
-                        console.error('Donut chart error:', e);
-                    }}
+                    }} catch(e) {{ console.error('Donut chart error:', e); }}
                 }})();
             </script>
         '''
 
-    def _create_bar_chart_svg(self, labels: list, data: list, colors: list | str, width: int = 500, height: int = 300) -> str:
+    def _create_bar_chart_svg(self, labels: list, data: list, colors: list | str, width: int = 250, height: int = 220) -> str:
         """Generate Chart.js bar chart"""
         import random
         chart_id = f"chart_{random.randint(10000, 99999)}"
@@ -269,9 +233,13 @@ class Tools:
                                 plugins: {{
                                     legend: {{ display: false }},
                                     tooltip: {{
+                                        enabled: true,
                                         backgroundColor: 'rgba(0, 0, 0, 0.8)',
+                                        titleColor: '#fff',
+                                        bodyColor: '#fff',
                                         padding: 12,
-                                        cornerRadius: 8
+                                        cornerRadius: 8,
+                                        displayColors: true
                                     }}
                                 }},
                                 scales: {{
@@ -294,7 +262,7 @@ class Tools:
             </script>
         '''
 
-    def _create_horizontal_bar_chart_svg(self, labels: list, data: list, color: str, width: int = 600, height: int = 400) -> str:
+    def _create_horizontal_bar_chart_svg(self, labels: list, data: list, color: str, width: int = 600, height: int = 250) -> str:
         """Generate Chart.js horizontal bar chart"""
         import random
         chart_id = f"chart_{random.randint(10000, 99999)}"
@@ -325,7 +293,7 @@ class Tools:
                             data: {{ labels: chartLabels, datasets: [{{ data: chartData, backgroundColor: chartColor, borderRadius: 6, borderSkipped: false }}] }},
                             options: {{
                                 indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-                                plugins: {{ legend: {{ display: false }}, tooltip: {{ backgroundColor: 'rgba(0,0,0,0.8)', padding: 12, cornerRadius: 8, callbacks: {{ label: function(c) {{ return c.parsed.x.toLocaleString(); }} }} }} }},
+                                plugins: {{ legend: {{ display: false }}, tooltip: {{ enabled: true, backgroundColor: 'rgba(0,0,0,0.8)', padding: 12, cornerRadius: 8 }} }},
                                 scales: {{ x: {{ beginAtZero: true, grid: {{ color: 'rgba(139,148,184,0.1)', drawBorder: false }}, ticks: {{ color: '#8b94b8', font: {{ size: 11 }} }} }}, y: {{ grid: {{ display: false }}, ticks: {{ color: '#8b94b8', font: {{ size: 12 }}, crossAlign: 'far' }} }} }}
                             }}
                         }});
@@ -464,24 +432,12 @@ class Tools:
                                     }}
                                 }},
                                 tooltip: {{
+                                    enabled: true,
                                     backgroundColor: 'rgba(0, 0, 0, 0.9)',
+                                    titleColor: '#fff',
+                                    bodyColor: '#fff',
                                     padding: 16,
-                                    cornerRadius: 10,
-                                    titleFont: {{
-                                        size: 14,
-                                        weight: 'bold'
-                                    }},
-                                    bodyFont: {{
-                                        size: 13
-                                    }},
-                                    callbacks: {{
-                                        title: function(context) {{
-                                            return context[0].dataset.label;
-                                        }},
-                                        label: function(context) {{
-                                            return context.parsed.x.toFixed(1) + '% of all users';
-                                        }}
-                                    }}
+                                    cornerRadius: 10
                                 }}
                             }}
                         }}
@@ -1777,10 +1733,12 @@ class Tools:
         }}
         .chart-container {{
             position: relative;
-            min-height: 300px;
+            min-height: 220px;
             display: flex;
-            align-items: center;
-            justify-content: center;
+            flex-direction: column;
+            align-items: stretch;
+            justify-content: flex-start;
+            overflow: visible;
         }}
         .section-header {{
             background: linear-gradient(180deg, var(--card-gradient-start), var(--card-gradient-end));
@@ -1900,7 +1858,7 @@ class Tools:
     
     <div class="container">
         <div class="header">
-            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.27</span></h1>
+            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.43</span></h1>
             <p><strong>Administrator:</strong> {admin_name} | <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
 
