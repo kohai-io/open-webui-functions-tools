@@ -1,7 +1,7 @@
 """
 title: Interactive User Dashboard
 author: open-webui
-version: 2.1.15
+version: 2.1.18
 description: Interactive dashboard with rich UI embedding. Shows user statistics with live charts and visualizations. Admins see system-wide metrics, users see personal stats. Enhanced model tracking focused on admin-relevant insights.
 required_open_webui_version: 0.3.9
 requirements: cryptography
@@ -117,6 +117,11 @@ class Tools:
         if sum(data) == 0:
             return f'<div style="height: {height}px; display: flex; align-items: center; justify-content: center; color: var(--text-muted);">No data</div>'
         
+        # Build JavaScript arrays manually (like distribution chart does) to avoid f-string issues
+        labels_js = '[' + ','.join(f"'{str(label).replace(chr(39), chr(92)+chr(39))}'" for label in labels) + ']'
+        data_js = '[' + ','.join(str(d) for d in data) + ']'
+        colors_js = '[' + ','.join(f"'{c}'" for c in colors) + ']'
+        
         return f'''
             <div id="container_{chart_id}" style="max-height: {height}px;"></div>
             <script>
@@ -126,13 +131,17 @@ class Tools:
                     canvas.id = '{chart_id}';
                     container.appendChild(canvas);
                     
+                    const chartLabels = {labels_js};
+                    const chartData = {data_js};
+                    const chartColors = {colors_js};
+                    
                     new Chart(canvas, {{
                         type: 'doughnut',
                         data: {{
-                            labels: {labels},
+                            labels: chartLabels,
                             datasets: [{{
-                                data: {data},
-                                backgroundColor: {colors},
+                                data: chartData,
+                                backgroundColor: chartColors,
                                 borderWidth: 2,
                                 borderColor: 'rgba(255, 255, 255, 0.2)'
                             }}]
@@ -1897,7 +1906,7 @@ class Tools:
     
     <div class="container">
         <div class="header">
-            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.15</span></h1>
+            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.18</span></h1>
             <p><strong>Administrator:</strong> {admin_name} | <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
 
@@ -2457,7 +2466,7 @@ class Tools:
 <body>
     <div class="container">
         <div class="header">
-            <h1>📊 Welcome back, {user_name}! <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.15</span></h1>
+            <h1>📊 Welcome back, {user_name}! <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.16</span></h1>
             <p><strong>Member since:</strong> {datetime.fromtimestamp(user.created_at).strftime('%Y-%m-%d')} ({account_age_days} days) | <strong>Role:</strong> {user.role.capitalize()}</p>
         </div>
 
