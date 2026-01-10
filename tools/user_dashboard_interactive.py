@@ -1,7 +1,7 @@
 """
 title: Interactive User Dashboard
 author: open-webui
-version: 2.1.44
+version: 2.2.0
 description: Interactive dashboard with rich UI embedding. Shows user statistics with live charts and visualizations. Admins see system-wide metrics, users see personal stats. Enhanced model tracking focused on admin-relevant insights.
 required_open_webui_version: 0.3.9
 requirements: cryptography
@@ -445,6 +445,71 @@ class Tools:
                 }})();
             </script>
         '''
+
+    async def get_capabilities(
+        self,
+        __user__=None,
+    ):
+        """
+        Explain what this dashboard tool can do.
+        
+        WHEN TO USE:
+        - User asks: "what can you do?", "help", "what are your capabilities?"
+        - User wants to know what features are available
+        - User is unsure how to use the dashboard
+        
+        :return: Description of available features
+        """
+        user_role = __user__.get("role", "user") if __user__ else "user"
+        
+        if user_role == "admin":
+            return """## 📊 Dashboard Tool Capabilities
+
+I can show you an **interactive visual dashboard** with charts and statistics about your Open WebUI platform.
+
+### What I Can Show You (Admin View):
+- **👥 Adoption Analytics** - User registrations, growth trends, active users
+- **📊 Usage Metrics** - Total chats, models used, token consumption
+- **⭐ Quality Metrics** - User feedback and satisfaction data
+- **📚 Content & Knowledge** - Files, storage, and knowledge base stats
+- **🔥 Top Users** - Most active users by chats and tokens
+- **🤖 Model Usage** - Which AI models are being used most
+
+### Visual Dashboard:
+- **"show dashboard"** - Display the full interactive dashboard with charts
+- **"show stats"** / **"view analytics"** - Same as above
+
+### Data Queries (No Charts):
+For specific questions without visuals, just ask naturally:
+- **"how many users?"** - Get user counts
+- **"total chats today?"** - Get chat statistics
+- **"which models are used most?"** - Get model rankings
+- **"top users by tokens"** - Get user leaderboards
+- **"what's the spend?"** - Get cost data (if LiteLLM enabled)
+
+Available data categories: `users`, `chats`, `models`, `tokens`, `files`, `groups`, `feedback`, `spend`, `knowledge`
+
+The dashboard includes interactive charts with tooltips, a dark/light theme toggle, and hover effects on all cards."""
+        else:
+            return """## 📊 Dashboard Tool Capabilities
+
+I can show you an **interactive visual dashboard** with your personal statistics.
+
+### What I Can Show You:
+- **💬 Your Chat Activity** - Total chats, recent activity
+- **📈 Usage Over Time** - Your engagement trends
+- **🤖 Models Used** - Which AI models you've interacted with
+
+### Visual Dashboard:
+- **"show dashboard"** - Display your personal dashboard with charts
+- **"show my stats"** / **"view my usage"** - Same as above
+
+### Data Queries (No Charts):
+For specific questions without visuals, just ask naturally:
+- **"how many chats do I have?"** - Get your chat count
+- **"my recent activity"** - Get your usage summary
+
+The dashboard includes interactive charts with tooltips and a dark/light theme toggle."""
 
     async def get_dashboard(
         self,
@@ -1863,7 +1928,7 @@ class Tools:
     
     <div class="container">
         <div class="header">
-            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.1.44</span></h1>
+            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.2.0</span></h1>
             <p><strong>Administrator:</strong> {admin_name} | <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
 
