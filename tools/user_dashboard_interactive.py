@@ -1,13 +1,13 @@
 """
 title: Interactive User Dashboard
 author: open-webui
-version: 2.2.0
-description: Interactive dashboard with rich UI embedding. Shows user statistics with live charts and visualizations. Admins see system-wide metrics, users see personal stats. Enhanced model tracking focused on admin-relevant insights.
+version: 2.3.2
+description: Interactive dashboard with rich UI embedding and time-based comparison analytics. Shows user statistics with live charts and visualizations. Admins see system-wide metrics with current vs previous period comparisons (day/week/month/quarter/half-year/year). Users see personal stats. Enhanced model tracking focused on admin-relevant insights.
 required_open_webui_version: 0.3.9
 requirements: cryptography
 """
 
-from pydantic import BaseModel, Field, GetCoreSchemaHandler
+from pydantic import BaseModel, Field, GetCoreSchemaHandler, field_validator
 from pydantic_core import core_schema
 from typing import Optional, Callable, Awaitable, Any
 from fastapi.responses import HTMLResponse
@@ -105,6 +105,14 @@ class Tools:
             default="",
             description="LiteLLM admin API key (encrypted)"
         )
+        
+        @field_validator('LITELLM_API_KEY', mode='before')
+        @classmethod
+        def encrypt_api_key(cls, v):
+            """Encrypt API key on save"""
+            if v and isinstance(v, str) and not v.startswith("encrypted:"):
+                return EncryptedStr.encrypt(v)
+            return v
 
     def __init__(self):
         self.valves = self.Valves()
@@ -196,40 +204,59 @@ class Tools:
         colors_b64 = base64.b64encode(colors_json.encode()).decode()
         
         return f'''
-            <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
-                 data-labels="{labels_b64}"
-                 data-values="{data_b64}"
-                 data-colors="{colors_b64}"></div>
+            <div id="wrapper_{chart_id}" style="position: relative; min-height: {height}px; max-height: {height + 30}px;">
+                <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
+                     data-labels="{labels_b64}"
+                     data-values="{data_b64}"
+                     data-colors="{colors_b64}"></div>
+                <button id="reset_{chart_id}" style="display: none; position: absolute; top: 4px; right: 4px; padding: 4px 10px; font-size: 11px; background: rgba(102, 126, 234, 0.9); color: white; border: none; border-radius: 4px; cursor: pointer; z-index: 10; transition: opacity 0.2s;" onmouseover="this.style.background='rgba(102, 126, 234, 1)'" onmouseout="this.style.background='rgba(102, 126, 234, 0.9)'">Reset</button>
+            </div>
             <script>
                 (function() {{
                     try {{
                         const container = document.getElementById('container_{chart_id}');
+                        const resetBtn = document.getElementById('reset_{chart_id}');
                         const canvas = document.createElement('canvas');
                         canvas.id = '{chart_id}';
                         container.appendChild(canvas);
                         
-                        // Decode base64 and parse JSON
                         const chartLabels = JSON.parse(atob(container.dataset.labels));
                         const chartData = JSON.parse(atob(container.dataset.values));
                         const chartColors = JSON.parse(atob(container.dataset.colors));
                         
-                        console.log('=== BAR CHART DEBUG ({chart_id}) ===');
-                        console.log('chartData:', chartData);
+                        const hiddenBars = new Set();
+                        const originalData = [...chartData];
+                        const originalColors = [...chartColors];
                         
-                        new Chart(canvas, {{
+                        const updateResetBtn = () => {{
+                            resetBtn.style.display = hiddenBars.size > 0 ? 'block' : 'none';
+                        }};
+                        
+                        const chart = new Chart(canvas, {{
                             type: 'bar',
                             data: {{
                                 labels: chartLabels,
-                                datasets: [{{
-                                    data: chartData,
-                                    backgroundColor: chartColors,
-                                    borderRadius: 6,
-                                    borderSkipped: false
-                                }}]
+                                datasets: [{{ data: chartData, backgroundColor: chartColors, borderRadius: 6, borderSkipped: false }}]
                             }},
                             options: {{
                                 responsive: true,
                                 maintainAspectRatio: true,
+                                onClick: (event, elements) => {{
+                                    if (elements.length > 0) {{
+                                        const index = elements[0].index;
+                                        if (hiddenBars.has(index)) {{
+                                            hiddenBars.delete(index);
+                                            chart.data.datasets[0].data[index] = originalData[index];
+                                            chart.data.datasets[0].backgroundColor[index] = originalColors[index];
+                                        }} else {{
+                                            hiddenBars.add(index);
+                                            chart.data.datasets[0].data[index] = 0;
+                                            chart.data.datasets[0].backgroundColor[index] = 'rgba(100, 100, 100, 0.2)';
+                                        }}
+                                        chart.update();
+                                        updateResetBtn();
+                                    }}
+                                }},
                                 plugins: {{
                                     legend: {{ display: false }},
                                     tooltip: {{
@@ -239,7 +266,16 @@ class Tools:
                                         bodyColor: '#fff',
                                         padding: 12,
                                         cornerRadius: 8,
-                                        displayColors: true
+                                        displayColors: true,
+                                        callbacks: {{
+                                            label: (context) => {{
+                                                const idx = context.dataIndex;
+                                                if (hiddenBars.has(idx)) {{
+                                                    return `${{originalData[idx]}} (hidden - click to restore)`;
+                                                }}
+                                                return context.formattedValue;
+                                            }}
+                                        }}
                                     }}
                                 }},
                                 scales: {{
@@ -254,6 +290,18 @@ class Tools:
                                     }}
                                 }}
                             }}
+                        }});
+                        
+                        canvas.style.cursor = 'pointer';
+                        
+                        resetBtn.addEventListener('click', () => {{
+                            hiddenBars.clear();
+                            for (let i = 0; i < originalData.length; i++) {{
+                                chart.data.datasets[0].data[i] = originalData[i];
+                                chart.data.datasets[0].backgroundColor[i] = originalColors[i];
+                            }}
+                            chart.update();
+                            updateResetBtn();
                         }});
                     }} catch(e) {{
                         console.error('Bar chart error:', e);
@@ -276,26 +324,78 @@ class Tools:
         data_b64 = base64.b64encode(data_json.encode()).decode()
         
         return f'''
-            <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
-                 data-labels="{labels_b64}" data-values="{data_b64}" data-color="{color}"></div>
+            <div id="wrapper_{chart_id}" style="position: relative; min-height: {height}px; max-height: {height + 30}px;">
+                <div id="container_{chart_id}" style="min-height: {height}px; max-height: {height}px;"
+                     data-labels="{labels_b64}" data-values="{data_b64}" data-color="{color}"></div>
+                <button id="reset_{chart_id}" style="display: none; position: absolute; top: 4px; right: 4px; padding: 4px 10px; font-size: 11px; background: rgba(102, 126, 234, 0.9); color: white; border: none; border-radius: 4px; cursor: pointer; z-index: 10;" onmouseover="this.style.background='rgba(102, 126, 234, 1)'" onmouseout="this.style.background='rgba(102, 126, 234, 0.9)'">Reset</button>
+            </div>
             <script>
                 (function() {{
                     try {{
                         const container = document.getElementById('container_{chart_id}');
+                        const resetBtn = document.getElementById('reset_{chart_id}');
                         const canvas = document.createElement('canvas');
                         canvas.id = '{chart_id}';
                         container.appendChild(canvas);
+                        
                         const chartLabels = JSON.parse(atob(container.dataset.labels));
                         const chartData = JSON.parse(atob(container.dataset.values));
                         const chartColor = container.dataset.color;
-                        new Chart(canvas, {{
+                        
+                        const hiddenBars = new Set();
+                        const originalData = [...chartData];
+                        
+                        const updateResetBtn = () => {{
+                            resetBtn.style.display = hiddenBars.size > 0 ? 'block' : 'none';
+                        }};
+                        
+                        const chart = new Chart(canvas, {{
                             type: 'bar',
                             data: {{ labels: chartLabels, datasets: [{{ data: chartData, backgroundColor: chartColor, borderRadius: 6, borderSkipped: false }}] }},
                             options: {{
                                 indexAxis: 'y', responsive: true, maintainAspectRatio: false,
-                                plugins: {{ legend: {{ display: false }}, tooltip: {{ enabled: true, backgroundColor: 'rgba(0,0,0,0.8)', padding: 12, cornerRadius: 8 }} }},
+                                onClick: (event, elements) => {{
+                                    if (elements.length > 0) {{
+                                        const index = elements[0].index;
+                                        if (hiddenBars.has(index)) {{
+                                            hiddenBars.delete(index);
+                                            chart.data.datasets[0].data[index] = originalData[index];
+                                            chart.data.datasets[0].backgroundColor[index] = chartColor;
+                                        }} else {{
+                                            hiddenBars.add(index);
+                                            chart.data.datasets[0].data[index] = 0;
+                                            chart.data.datasets[0].backgroundColor[index] = 'rgba(100, 100, 100, 0.2)';
+                                        }}
+                                        chart.update();
+                                        updateResetBtn();
+                                    }}
+                                }},
+                                plugins: {{
+                                    legend: {{ display: false }},
+                                    tooltip: {{
+                                        enabled: true, backgroundColor: 'rgba(0,0,0,0.8)', padding: 12, cornerRadius: 8,
+                                        callbacks: {{
+                                            label: (context) => {{
+                                                const idx = context.dataIndex;
+                                                if (hiddenBars.has(idx)) return `${{originalData[idx]}} (hidden - click to restore)`;
+                                                return context.formattedValue;
+                                            }}
+                                        }}
+                                    }}
+                                }},
                                 scales: {{ x: {{ beginAtZero: true, grid: {{ color: 'rgba(139,148,184,0.1)', drawBorder: false }}, ticks: {{ color: '#8b94b8', font: {{ size: 11 }} }} }}, y: {{ grid: {{ display: false }}, ticks: {{ color: '#8b94b8', font: {{ size: 12 }}, crossAlign: 'far' }} }} }}
                             }}
+                        }});
+                        canvas.style.cursor = 'pointer';
+                        
+                        resetBtn.addEventListener('click', () => {{
+                            hiddenBars.clear();
+                            for (let i = 0; i < originalData.length; i++) {{
+                                chart.data.datasets[0].data[i] = originalData[i];
+                                chart.data.datasets[0].backgroundColor[i] = chartColor;
+                            }}
+                            chart.update();
+                            updateResetBtn();
                         }});
                     }} catch(e) {{ console.error('Horizontal bar chart error:', e); }}
                 }})();
@@ -789,6 +889,22 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
         def should_include(category: str) -> bool:
             return categories is None or category in categories
         
+        # Helper to calculate comparison metrics
+        def calc_comparison(current: float, previous: float) -> dict:
+            """Calculate delta and percentage change between current and previous period"""
+            delta = current - previous
+            pct_change = (
+                (delta / previous * 100)
+                if previous > 0
+                else (100.0 if current > 0 else 0.0)
+            )
+            return {
+                "current": current,
+                "previous": previous,
+                "delta": delta,
+                "delta_pct": round(pct_change, 1),
+            }
+        
         # Always fetch users for basic stats (needed for other calculations)
         await emit_status("Fetching user data...")
         all_users_data = Users.get_users()
@@ -796,9 +912,22 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
         total_users = all_users_data.get("total", 0)
         
         now = int(time.time())
+        
+        # Current period boundaries
         day_ago = now - 86400
         week_ago = now - 604800
         month_ago = now - 2592000
+        quarter_ago = now - (86400 * 90)
+        half_year_ago = now - (86400 * 180)
+        year_ago = now - (86400 * 365)
+        
+        # Previous period boundaries (for comparison)
+        two_days_ago = now - (86400 * 2)
+        two_weeks_ago = now - (604800 * 2)
+        two_months_ago = now - (2592000 * 2)
+        two_quarters_ago = now - (86400 * 180)
+        one_year_ago = now - (86400 * 365)
+        two_years_ago = now - (86400 * 730)
         
         # User-specific metrics (only if "users" category requested)
         if should_include("users"):
@@ -829,12 +958,59 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
             
             # Inactive users (zero chats)
             inactive_users = sum(1 for u in all_users if len(Chats.get_chats_by_user_id(u.id)) == 0)
+            
+            # Previous period metrics for comparison
+            users_previous_day = sum(1 for u in all_users if two_days_ago <= u.created_at < day_ago)
+            users_previous_week = sum(1 for u in all_users if two_weeks_ago <= u.created_at < week_ago)
+            users_previous_month = sum(1 for u in all_users if two_months_ago <= u.created_at < month_ago)
+            users_previous_quarter = sum(1 for u in all_users if two_quarters_ago <= u.created_at < quarter_ago)
+            users_previous_half_year = sum(1 for u in all_users if one_year_ago <= u.created_at < half_year_ago)
+            users_previous_year = sum(1 for u in all_users if two_years_ago <= u.created_at < year_ago)
+            
+            active_previous_day = sum(1 for u in all_users if two_days_ago <= u.last_active_at < day_ago)
+            active_previous_week = sum(1 for u in all_users if two_weeks_ago <= u.last_active_at < week_ago)
+            active_previous_month = sum(1 for u in all_users if two_months_ago <= u.last_active_at < month_ago)
+            active_previous_quarter = sum(1 for u in all_users if two_quarters_ago <= u.last_active_at < quarter_ago)
+            active_previous_half_year = sum(1 for u in all_users if one_year_ago <= u.last_active_at < half_year_ago)
+            active_previous_year = sum(1 for u in all_users if two_years_ago <= u.last_active_at < year_ago)
+            
+            # Extended period metrics
+            users_this_quarter = sum(1 for u in all_users if u.created_at >= quarter_ago)
+            users_this_half_year = sum(1 for u in all_users if u.created_at >= half_year_ago)
+            users_this_year = sum(1 for u in all_users if u.created_at >= year_ago)
+            
+            active_last_quarter = sum(1 for u in all_users if u.last_active_at >= quarter_ago)
+            active_last_half_year = sum(1 for u in all_users if u.last_active_at >= half_year_ago)
+            active_last_year = sum(1 for u in all_users if u.last_active_at >= year_ago)
+            
+            # Comparison data structures
+            user_registration_comparison = {
+                "day": calc_comparison(users_today, users_previous_day),
+                "week": calc_comparison(users_this_week, users_previous_week),
+                "month": calc_comparison(users_this_month, users_previous_month),
+                "quarter": calc_comparison(users_this_quarter, users_previous_quarter),
+                "half_year": calc_comparison(users_this_half_year, users_previous_half_year),
+                "year": calc_comparison(users_this_year, users_previous_year),
+            }
+            
+            user_activity_comparison = {
+                "day": calc_comparison(active_last_24h, active_previous_day),
+                "week": calc_comparison(active_last_week, active_previous_week),
+                "month": calc_comparison(active_last_month, active_previous_month),
+                "quarter": calc_comparison(active_last_quarter, active_previous_quarter),
+                "half_year": calc_comparison(active_last_half_year, active_previous_half_year),
+                "year": calc_comparison(active_last_year, active_previous_year),
+            }
         else:
             # Provide minimal defaults for HTML generation
             users_today = users_this_week = users_this_month = 0
+            users_this_quarter = users_this_half_year = users_this_year = 0
             active_last_24h = active_last_week = active_last_month = active_all_time = 0
+            active_last_quarter = active_last_half_year = active_last_year = 0
             active_now_count = admin_count = user_count = pending_count = 0
             inactive_users = 0
+            user_registration_comparison = {}
+            user_activity_comparison = {}
         
         # Chat statistics (fetch if chats, models, or tokens needed)
         if should_include("chats") or should_include("models") or should_include("tokens"):
@@ -848,13 +1024,38 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
                 chat_activity_today = sum(1 for c in all_chats if c.updated_at >= day_ago)
                 chat_activity_week = sum(1 for c in all_chats if c.updated_at >= week_ago)
                 chat_activity_month = sum(1 for c in all_chats if c.updated_at >= month_ago)
+                chat_activity_quarter = sum(1 for c in all_chats if c.updated_at >= quarter_ago)
+                chat_activity_half_year = sum(1 for c in all_chats if c.updated_at >= half_year_ago)
+                chat_activity_year = sum(1 for c in all_chats if c.updated_at >= year_ago)
+                
+                # Previous period chat activity
+                chat_activity_previous_day = sum(1 for c in all_chats if two_days_ago <= c.updated_at < day_ago)
+                chat_activity_previous_week = sum(1 for c in all_chats if two_weeks_ago <= c.updated_at < week_ago)
+                chat_activity_previous_month = sum(1 for c in all_chats if two_months_ago <= c.updated_at < month_ago)
+                chat_activity_previous_quarter = sum(1 for c in all_chats if two_quarters_ago <= c.updated_at < quarter_ago)
+                chat_activity_previous_half_year = sum(1 for c in all_chats if one_year_ago <= c.updated_at < half_year_ago)
+                chat_activity_previous_year = sum(1 for c in all_chats if two_years_ago <= c.updated_at < year_ago)
+                
+                # Chat activity comparison
+                chat_activity_comparison = {
+                    "day": calc_comparison(chat_activity_today, chat_activity_previous_day),
+                    "week": calc_comparison(chat_activity_week, chat_activity_previous_week),
+                    "month": calc_comparison(chat_activity_month, chat_activity_previous_month),
+                    "quarter": calc_comparison(chat_activity_quarter, chat_activity_previous_quarter),
+                    "half_year": calc_comparison(chat_activity_half_year, chat_activity_previous_half_year),
+                    "year": calc_comparison(chat_activity_year, chat_activity_previous_year),
+                }
             else:
                 total_chats_archived = total_chats_pinned = 0
                 chat_activity_today = chat_activity_week = chat_activity_month = 0
+                chat_activity_quarter = chat_activity_half_year = chat_activity_year = 0
+                chat_activity_comparison = {}
         else:
             all_chats = []
             total_chats = total_chats_archived = total_chats_pinned = 0
             chat_activity_today = chat_activity_week = chat_activity_month = 0
+            chat_activity_quarter = chat_activity_half_year = chat_activity_year = 0
+            chat_activity_comparison = {}
         
         # Model usage and token tracking (only if models or tokens requested)
         model_usage = {}
@@ -2180,16 +2381,24 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
                 "new_users_today": users_today,
                 "new_users_this_week": users_this_week,
                 "new_users_this_month": users_this_month,
+                "new_users_this_quarter": users_this_quarter,
+                "new_users_this_half_year": users_this_half_year,
+                "new_users_this_year": users_this_year,
                 "active_last_24h": active_last_24h,
                 "active_last_week": active_last_week,
                 "active_last_month": active_last_month,
+                "active_last_quarter": active_last_quarter,
+                "active_last_half_year": active_last_half_year,
+                "active_last_year": active_last_year,
                 "active_all_time": active_all_time,
                 "active_now": active_now_count,
                 "roles": {
                     "admin": admin_count,
                     "user": user_count,
                     "pending": pending_count
-                }
+                },
+                "registration_comparison": user_registration_comparison,
+                "activity_comparison": user_activity_comparison,
             }
         
         if should_include("chats"):
@@ -2200,7 +2409,11 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
                 "activity_today": chat_activity_today,
                 "activity_week": chat_activity_week,
                 "activity_month": chat_activity_month,
-                "activity_all_time": total_chats
+                "activity_quarter": chat_activity_quarter,
+                "activity_half_year": chat_activity_half_year,
+                "activity_year": chat_activity_year,
+                "activity_all_time": total_chats,
+                "activity_comparison": chat_activity_comparison,
             }
         
         if should_include("files"):
