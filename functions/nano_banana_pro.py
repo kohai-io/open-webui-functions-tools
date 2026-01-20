@@ -2,12 +2,13 @@
 title: Google Gemini 3 Pro Image Generation (Chat Pipe)
 author: open-webui
 date: 2025-12-11
-version: 3.8
+version: 4.4
 license: MIT
 description: A pipe for professional image generation using Google Gemini 3 Pro Image with high-resolution output (1K/2K/4K) and up to 14 reference images. Aspect ratio and resolution settings are sticky across conversation.
 requirements: google-genai>=1.50.0, cryptography, requests, google-auth, c2pa-python
 """
 
+import asyncio
 import base64
 import mimetypes
 import os
@@ -365,13 +366,20 @@ class Pipe:
     ) -> None:
         """Emit status updates to Open WebUI"""
         if not event_emitter:
+            self._debug(f"emit_status: No event_emitter available")
             return
 
         if not self.valves.ENABLE_STATUS_INDICATOR:
+            self._debug(f"emit_status: Status indicator disabled")
             return
 
         current_time = time.time()
-        if current_time - self.last_emit_time >= self.valves.EMIT_INTERVAL or done:
+        time_since_last = current_time - self.last_emit_time
+        should_emit = time_since_last >= self.valves.EMIT_INTERVAL or done
+        
+        self._debug(f"emit_status: msg='{message[:50]}...' done={done} should_emit={should_emit} (interval={time_since_last:.2f}s)")
+        
+        if should_emit:
             try:
                 await event_emitter(
                     {
@@ -383,6 +391,7 @@ class Pipe:
                     }
                 )
                 self.last_emit_time = current_time
+                self._debug(f"emit_status: Successfully emitted status")
             except Exception as e:
                 self._debug(f"Failed to emit status: {e}")
 
@@ -909,15 +918,46 @@ class Pipe:
         - When downloading images, use retry/backoff and return None on failure to allow graceful degradation.
         """
 
-        # Check if this is a follow-up generation request
+        # Check if this is a system task request (title generation, follow-ups, tags, etc.)
+        # These tasks should not trigger image generation
         metadata = body.get("metadata", {})
-        is_follow_up_task = metadata.get("task") == "FOLLOW_UP_GENERATION"
-
+        task = metadata.get("task", "")
+        self._debug(f"Metadata task: '{task}'")
+        
+        # Official OWUI task types from constants.py - these should never trigger image generation
+        SYSTEM_TASKS = {
+            "title_generation",
+            "follow_up_generation",
+            "tags_generation",
+            "emoji_generation",
+            "query_generation",
+            "autocomplete_generation",
+            "moa_response_generation",
+            # Also check uppercase variants for compatibility
+            "TITLE_GENERATION",
+            "FOLLOW_UP_GENERATION",
+            "TAGS_GENERATION",
+            "EMOJI_GENERATION",
+            "QUERY_GENERATION",
+            "AUTOCOMPLETE_GENERATION",
+            "MOA_RESPONSE_GENERATION",
+        }
+        
+        is_system_task = task in SYSTEM_TASKS
+        
+        # Special handling for follow-up generation (may use custom follow-ups)
+        is_follow_up_task = task in ("follow_up_generation", "FOLLOW_UP_GENERATION")
+        
         if is_follow_up_task and self.valves.ENABLE_CUSTOM_FOLLOW_UPS:
             self._debug(
                 "Detected follow-up generation request - using custom image follow-ups"
             )
             return await self._generate_image_follow_ups(body, __event_emitter__)
+        
+        if is_system_task:
+            # Silently ignore all system tasks - they're not image generation requests
+            self._debug(f"Ignoring system task: {task}")
+            return body  # Return without error
 
         await self.emit_status(
             __event_emitter__, "info", "Initializing Gemini image generator..."
@@ -985,38 +1025,61 @@ class Pipe:
                 self._debug(f"Using edit_guidance as prompt")
 
             if not prompt:
-                # Check if this is a system follow-up instruction (should be silently ignored)
+                # Check if this is a system meta-request (title generation, follow-ups, tags, etc.)
+                # These are OWUI task templates that should not trigger image generation
                 last_user_msg = None
                 for msg in reversed(messages or []):
                     if msg.get("role") == "user":
                         last_user_msg = msg
                         break
 
-                is_system_followup = False
+                is_system_request = False
                 if last_user_msg:
                     content = last_user_msg.get("content", "")
                     if isinstance(content, str):
                         text = content.lower().strip()
-                        # Detect system follow-up patterns
-                        if re.search(
-                            r"suggest.*follow[- ]up.*(question|prompt|topic)", text
-                        ):
-                            is_system_followup = True
-                        elif re.match(
-                            r"^(please\s+)?(suggest|provide|generate)\s+\d*\s*follow[- ]up",
-                            text,
-                        ):
-                            is_system_followup = True
+                        
+                        # Detect OWUI task template patterns (from config.py DEFAULT_*_TEMPLATE)
+                        # These all start with "### Task:" followed by specific instructions
+                        if "### task:" in text:
+                            # Title generation: "generate a concise, 3-5 word title"
+                            if "title" in text and ("emoji" in text or "summariz" in text):
+                                is_system_request = True
+                            # Follow-up generation: "suggest 3-5 relevant follow-up questions"
+                            elif "follow-up" in text or "follow up" in text:
+                                is_system_request = True
+                            # Tags generation: "generate 1-3 broad tags"
+                            elif "tags" in text and ("categoriz" in text or "themes" in text):
+                                is_system_request = True
+                            # Image prompt generation: "generate a detailed prompt for am image generation"
+                            elif "image generation task" in text and "describe the image" in text:
+                                is_system_request = True
+                            # Generic task detection - if it has ### task: and chat_history, it's likely a system task
+                            elif "<chat_history>" in text or "{{messages" in text:
+                                is_system_request = True
+                        
+                        # Fallback patterns for non-template system requests
+                        if not is_system_request:
+                            # Detect system follow-up patterns
+                            if re.search(r"suggest.*follow[- ]up.*(question|prompt|topic)", text):
+                                is_system_request = True
+                            elif re.match(r"^(please\s+)?(suggest|provide|generate)\s+\d*\s*follow[- ]up", text):
+                                is_system_request = True
+                            # Detect title generation requests
+                            elif re.search(r"generate.*title.*summar", text):
+                                is_system_request = True
 
-                if is_system_followup:
-                    # Silently ignore system follow-up instructions - don't generate or show error
+                if is_system_request:
+                    # Silently ignore system meta-requests - don't generate or show error
                     self._debug(
-                        "Ignoring system follow-up instruction (not an image generation request)"
+                        "Ignoring system meta-request (title/follow-up/tags generation)"
                     )
+                    await self.emit_status(__event_emitter__, "info", "", True)  # Clear status
                     return body  # Return without adding error message
                 else:
                     # Real error - no valid prompt found
                     error_msg = "❌ Error: No prompt provided for image generation."
+                    await self.emit_status(__event_emitter__, "error", error_msg, True)
                     body["messages"].append({"role": "assistant", "content": error_msg})
                     return body
 
@@ -1200,18 +1263,64 @@ class Pipe:
                 __event_emitter__, "info", "Generating image with Gemini..."
             )
 
-            # Generate content using streaming
+            # Generate content using streaming with keepalive status updates
+            # Run the blocking stream in a thread while sending periodic status updates
             result_content = []
             image_count = 0
             text_seen = False
             generated_image_markdowns: List[str] = []
+            generation_complete = False
+            generation_start_time = time.time()
+            chunks_queue = []  # Collect chunks from thread
+            generation_error = None
+
+            def run_generation():
+                """Run the blocking generation in a thread."""
+                nonlocal generation_error
+                try:
+                    for chunk in client.models.generate_content_stream(
+                        model=self.valves.model_name,
+                        contents=contents,
+                        config=generate_content_config,
+                    ):
+                        chunks_queue.append(chunk)
+                except Exception as e:
+                    generation_error = e
+
+            # Start generation in a thread
+            loop = asyncio.get_event_loop()
+            generation_task = loop.run_in_executor(None, run_generation)
+
+            # Send keepalive status updates while waiting for generation
+            status_intervals = [15, 30, 45, 60, 90, 120]  # seconds
+            next_status_index = 0
+            
+            while not generation_task.done():
+                elapsed = int(time.time() - generation_start_time)
+                
+                # Send periodic status updates to keep WebSocket alive
+                if next_status_index < len(status_intervals):
+                    if elapsed >= status_intervals[next_status_index]:
+                        await self.emit_status(
+                            __event_emitter__, "info", f"Still generating image... ({elapsed}s elapsed)"
+                        )
+                        next_status_index += 1
+                elif elapsed % 60 == 0 and elapsed > 0:
+                    # After all intervals, update every minute
+                    await self.emit_status(
+                        __event_emitter__, "info", f"Still generating image... ({elapsed}s elapsed)"
+                    )
+                
+                await asyncio.sleep(1)  # Check every second
+            
+            # Wait for generation to complete
+            await generation_task
+            
+            if generation_error:
+                raise generation_error
 
             try:
-                for chunk in client.models.generate_content_stream(
-                    model=self.valves.model_name,
-                    contents=contents,
-                    config=generate_content_config,
-                ):
+                for chunk in chunks_queue:
                     self._debug(f"Got chunk: {chunk}")
 
                     prompt_feedback = getattr(chunk, "prompt_feedback", None)
@@ -1335,17 +1444,10 @@ class Pipe:
                                     f"![Generated Image]({url})"
                                 )
                                 
-                                # Send image message via event emitter for immediate UI rendering
-                                # This is critical for 2K/4K images to avoid memory/rendering issues
-                                if __event_emitter__:
-                                    await __event_emitter__(
-                                        {
-                                            "type": "message",
-                                            "data": {
-                                                "content": f"![Generated Image]({url})"
-                                            },
-                                        }
-                                    )
+                                # Clear status - image will be displayed via return value
+                                await self.emit_status(
+                                    __event_emitter__, "info", "Image generation complete!", True
+                                )
                             except Exception as e:
                                 self._debug(f"Failed to upload image: {e}")
                                 # Fallback to base64 if upload fails
@@ -1355,16 +1457,10 @@ class Pipe:
                                     f"![Generated Image]({data_uri})"
                                 )
                                 
-                                # Send base64 image via event emitter for immediate UI rendering
-                                if __event_emitter__:
-                                    await __event_emitter__(
-                                        {
-                                            "type": "message",
-                                            "data": {
-                                                "content": f"![Generated Image]({data_uri})"
-                                            },
-                                        }
-                                    )
+                                # Clear status - image will be displayed via return value
+                                await self.emit_status(
+                                    __event_emitter__, "info", "Image generation complete!", True
+                                )
             except Exception as e:
                 # If streaming fails mid-way, emit partial results if any, else a clear error
                 partial_text = "\n\n".join(str(c) for c in result_content if c).strip()
@@ -1381,6 +1477,7 @@ class Pipe:
                     if safety_msg:
                         return await self._emit_policy_block(body, __event_emitter__, safety_msg)
                     error_content = f"⚠️ Partial response before error:\n\n{combined}\n\n❌ Error: {str(e)}.{tip}"
+                    await self.emit_status(__event_emitter__, "error", f"Error: {str(e)}", True)
                     body["messages"].append(
                         {
                             "role": "assistant",
@@ -1393,6 +1490,7 @@ class Pipe:
                     if safety_msg:
                         return await self._emit_policy_block(body, __event_emitter__, safety_msg)
                     error_content = f"❌ Error: {str(e)}.{tip}"
+                    await self.emit_status(__event_emitter__, "error", f"Error: {str(e)}", True)
                     body["messages"].append(
                         {
                             "role": "assistant",
@@ -1405,38 +1503,38 @@ class Pipe:
                 f"Generated {image_count} images, {len(result_content)} content items"
             )
 
-            await self.emit_status(__event_emitter__, "info", "Finalizing response...")
-
+            # Don't emit "Finalizing response..." - it would reopen the status after "Image generation complete!"
+            
             if image_count > 0:
-                if not result_content or not any(
-                    isinstance(c, str) and c.strip() for c in result_content
-                ):
-                    result_content.insert(0, "Here's your generated image:")
+                # Images are sent via "files" event, no need for placeholder text
+                pass
             elif not result_content:
                 result_content = [
                     "I wasn't able to generate any content for your request."
                 ]
 
-            # Return in pipeline format
+            # Return in pipeline format - include images in response for persistence
             response_content = "\n\n".join(str(c) for c in result_content if c)
-            # Append any generated image links so they're persisted in chat history
+            
+            # Append image markdowns for persistence in chat history
             if generated_image_markdowns:
                 if response_content:
-                    response_content = (
-                        response_content + "\n\n" + "\n".join(generated_image_markdowns)
-                    )
+                    response_content = response_content + "\n\n" + "\n".join(generated_image_markdowns)
                 else:
                     response_content = "\n".join(generated_image_markdowns)
+            
             self._debug(f"Final response content length: {len(response_content)}")
-            self._debug(f"Final response preview: {response_content[:200]}...")
+            self._debug(f"Final response preview: {response_content[:200] if response_content else '(empty)'}...")
 
-            # Emit completion status BEFORE returning (otherwise it never runs)
+            # Final status clear - ensures status is cleared even if earlier emit was missed
+            # due to WebSocket timeout during long generation (e.g., 4K images taking 60-90s)
             await self.emit_status(
-                __event_emitter__, "info", "Image generation complete!", True
+                __event_emitter__, "info", "Complete!", True
             )
+            
+            # Small delay to ensure WebSocket events are flushed before HTTP response
+            await asyncio.sleep(0.1)
 
-            # Append the assistant message for history, but return the content string for inline handling
-            # (Following veo_inline.py pattern for proper UI rendering)
             body["messages"].append({"role": "assistant", "content": response_content})
             self._debug(
                 f"Appended assistant message with {len(response_content)} chars"
@@ -1649,7 +1747,9 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
             "question" in lower or "prompt" in lower
         ):
             return True
-        if len(lower.split()) <= 1 and len(lower) < 4:
+        # Don't block short prompts - "cat", "dog", "sun" are valid image requests
+        # Only block if it's empty or just punctuation
+        if not lower or lower in (".", "..", "...", ""):
             return True
         return False
 
@@ -1662,6 +1762,7 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
         Returns (prompt, user_has_image).
         """
         for msg in reversed(messages or []):
+            self._debug(f"Checking message: role={msg.get('role')}, content_preview={str(msg.get('content', ''))[:100]}")
             if (msg or {}).get("role") != "user":
                 continue
             content = (msg or {}).get("content", "")

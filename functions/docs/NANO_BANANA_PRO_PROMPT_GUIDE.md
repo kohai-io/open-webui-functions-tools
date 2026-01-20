@@ -4,6 +4,23 @@
 
 This guide helps you get the best results from Nano Banana Pro, a powerful AI image generation tool using Google's Gemini 3 Pro Image model.
 
+---
+
+## Quick Reference
+
+| Setting        | Options                      | Keywords                                 |
+|----------------|------------------------------|------------------------------------------|
+| **Resolution** | `1K`, `2K`, `4K`             | Just include in prompt: "4K image of..." |
+| **Square**     | `1:1`                        | `square`                                 |
+| **Portrait**   | `9:16`, `2:3`, `3:4`, `4:5`  | `portrait`, `vertical`, `tall`           |
+| **Landscape**  | `16:9`, `3:2`, `4:3`, `5:4`  | `landscape`, `wide`, `cinematic`         |
+| **Classic**    | `4:3`                        | `classic`                                |
+| **Ultrawide**  | `21:9`                       | `ultrawide`                              |
+
+**Settings are sticky** - once set, they persist for the entire conversation.
+
+---
+
 ## How do I generate an image?
 
 Simply describe what you want to see in natural language. Be as detailed or as simple as you like:
@@ -49,11 +66,10 @@ Nano Banana Pro supports 10 different aspect ratios. You can specify them using 
 
 **Landscape/Horizontal formats:**
 - `3:2` - Classic photography
-- `4:3` - Standard landscape
+- `4:3` - Standard landscape (keyword: `classic`)
 - `5:4` - Wide landscape
-- `16:9` - Widescreen, YouTube
-- `21:9` - Ultrawide, cinematic
-- Use keywords: "landscape", "horizontal", "widescreen", "ultrawide", "panoramic", "cinematic"
+- `16:9` - Widescreen, YouTube (keywords: `landscape`, `wide`, `cinematic`)
+- `21:9` - Ultrawide (keyword: `ultrawide`)
 
 **Examples:**
 ```
@@ -351,6 +367,6 @@ An alternative faster model (**gemini-2.5-flash-image**) may be available depend
 
 ---
 
-**Document Version**: 3.4  
-**Last Updated**: December 2025  
-**Pipeline**: nano_banana_pro.py
+**Document Version**: 4.4  
+**Last Updated**: January 2026  
+**Pipeline**: nano_banana_pro.py v4.4
