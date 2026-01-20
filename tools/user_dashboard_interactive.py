@@ -1,7 +1,7 @@
 """
 title: Interactive User Dashboard
 author: open-webui
-version: 2.3.2
+version: 2.3.8
 description: Interactive dashboard with rich UI embedding and time-based comparison analytics. Shows user statistics with live charts and visualizations. Admins see system-wide metrics with current vs previous period comparisons (day/week/month/quarter/half-year/year). Users see personal stats. Enhanced model tracking focused on admin-relevant insights.
 required_open_webui_version: 0.3.9
 requirements: cryptography
@@ -956,8 +956,8 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
             user_count = sum(1 for u in all_users if u.role == "user")
             pending_count = sum(1 for u in all_users if u.role == "pending")
             
-            # Inactive users (zero chats)
-            inactive_users = sum(1 for u in all_users if len(Chats.get_chats_by_user_id(u.id)) == 0)
+            # Inactive users (zero chats) - uses user_chats_lookup built later, deferred calculation
+            inactive_users = 0  # Will be calculated after user_chats_lookup is built
             
             # Previous period metrics for comparison
             users_previous_day = sum(1 for u in all_users if two_days_ago <= u.created_at < day_ago)
@@ -1013,11 +1013,20 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
             user_activity_comparison = {}
         
         # Chat statistics (fetch if chats, models, or tokens needed)
+        # OPTIMIZATION: Always fetch all_chats once and build user→chats map to avoid N+1 queries
+        await emit_status("Analyzing chat history...")
+        all_chats = Chats.get_chats()
+        total_chats = len(all_chats)
+        
+        # Build user_id → chats map (single pass, reused for inactive_users and user_chat_data)
+        user_chats_lookup = {}
+        for chat in all_chats:
+            uid = chat.user_id
+            if uid not in user_chats_lookup:
+                user_chats_lookup[uid] = []
+            user_chats_lookup[uid].append(chat)
+        
         if should_include("chats") or should_include("models") or should_include("tokens"):
-            await emit_status("Analyzing chat history...")
-            all_chats = Chats.get_chats()
-            total_chats = len(all_chats)
-            
             if should_include("chats"):
                 total_chats_archived = sum(1 for c in all_chats if c.archived)
                 total_chats_pinned = sum(1 for c in all_chats if c.pinned)
@@ -1192,33 +1201,39 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
             model_config_stats['modelfiles_used'] = sum(1 for m in all_models_enhanced if m['is_modelfile'])
             model_config_stats['hidden_models_in_use'] = len(hidden_models_in_use)
         
-        # User activity with token tracking
+        # OPTIMIZATION: Calculate inactive_users using lookup (avoids N+1 queries)
+        if should_include("users"):
+            inactive_users = sum(1 for u in all_users if u.id not in user_chats_lookup)
+        
+        # User activity with token tracking - OPTIMIZED: uses user_chats_lookup instead of N+1 queries
+        # Include ALL users (even those with zero chats) so created_at/last_active_at are available
         user_chat_data = []
         for user in all_users:
-            chats = Chats.get_chats_by_user_id(user.id)
-            if len(chats) > 0:
-                # Calculate token usage for this user
-                user_prompt_tokens = 0
-                user_completion_tokens = 0
-                
-                for chat in chats:
-                    chat_data = chat.chat if hasattr(chat, 'chat') else {}
-                    if isinstance(chat_data, dict):
-                        messages = chat_data.get("messages", [])
-                        for msg in messages:
-                            if isinstance(msg, dict) and "usage" in msg:
-                                usage = msg.get("usage", {})
-                                if isinstance(usage, dict):
-                                    user_prompt_tokens += usage.get("prompt_tokens", 0)
-                                    user_completion_tokens += usage.get("completion_tokens", 0)
-                
-                user_chat_data.append({
-                    'name': user.name,
-                    'chats': len(chats),
-                    'user_id': user.id,
-                    'prompt_tokens': user_prompt_tokens,
-                    'completion_tokens': user_completion_tokens
-                })
+            chats = user_chats_lookup.get(user.id, [])
+            # Calculate token usage for this user
+            user_prompt_tokens = 0
+            user_completion_tokens = 0
+            
+            for chat in chats:
+                chat_data = chat.chat if hasattr(chat, 'chat') else {}
+                if isinstance(chat_data, dict):
+                    messages = chat_data.get("messages", [])
+                    for msg in messages:
+                        if isinstance(msg, dict) and "usage" in msg:
+                            usage = msg.get("usage", {})
+                            if isinstance(usage, dict):
+                                user_prompt_tokens += usage.get("prompt_tokens", 0)
+                                user_completion_tokens += usage.get("completion_tokens", 0)
+            
+            user_chat_data.append({
+                'name': user.name,
+                'chats': len(chats),
+                'user_id': user.id,
+                'prompt_tokens': user_prompt_tokens,
+                'completion_tokens': user_completion_tokens,
+                'created_at': user.created_at,
+                'last_active_at': user.last_active_at
+            })
         
         user_chat_data.sort(key=lambda x: x['chats'], reverse=True)
         
@@ -2129,7 +2144,7 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
     
     <div class="container">
         <div class="header">
-            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.2.0</span></h1>
+            <h1>📊 Admin Dashboard <span style="font-size: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 4px 12px; border-radius: 12px; font-weight: 500; margin-left: 12px;">v2.3.8</span></h1>
             <p><strong>Administrator:</strong> {admin_name} | <strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         </div>
 
@@ -2145,12 +2160,12 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
                 <div class="label"><span class="mono">{active_last_24h}</span> active today{f', {active_now_count} online now' if active_now_count > 0 else ''}</div>
             </div>
             <div class="stat-card">
-                <h3>New Users (Week)</h3>
+                <h3>New Users (Last 7 Days)</h3>
                 <div class="value mono">{users_this_week}</div>
                 <div class="label"><span class="mono">{users_today}</span> registered today</div>
             </div>
             <div class="stat-card">
-                <h3>Active Users (Week)</h3>
+                <h3>Active Users (Last 7 Days)</h3>
                 <div class="value mono">{active_last_week}</div>
                 <div class="label"><span class="mono">{active_last_month}</span> active this month</div>
             </div>
@@ -2520,6 +2535,8 @@ The dashboard includes interactive charts with tooltips and a dark/light theme t
                 {
                     "name": u['name'],
                     "chats": u['chats'],
+                    "created_at": datetime.utcfromtimestamp(u.get('created_at')).isoformat() + 'Z' if u.get('created_at') else None,
+                    "last_active_at": datetime.utcfromtimestamp(u.get('last_active_at')).isoformat() + 'Z' if u.get('last_active_at') else None,
                     "spend": round(u.get('spend', 0.0), 2) if self.valves.ENABLE_LITELLM_COSTS else None
                 }
                 for u in users_list
