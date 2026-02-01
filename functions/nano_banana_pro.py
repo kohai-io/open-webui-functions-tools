@@ -2,7 +2,7 @@
 title: Google Gemini 3 Pro Image Generation (Chat Pipe)
 author: open-webui
 date: 2025-12-11
-version: 4.4
+version: 4.9
 license: MIT
 description: A pipe for professional image generation using Google Gemini 3 Pro Image with high-resolution output (1K/2K/4K) and up to 14 reference images. Aspect ratio and resolution settings are sticky across conversation.
 requirements: google-genai>=1.50.0, cryptography, requests, google-auth, c2pa-python
@@ -18,6 +18,9 @@ import requests
 import time
 import json
 import io
+import tempfile
+import traceback
+from math import gcd
 from datetime import datetime
 from typing import Optional, Any, List, Dict, Union, Callable, Awaitable
 from cryptography.fernet import Fernet, InvalidToken
@@ -25,6 +28,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
 from pydantic_core import core_schema
+
+try:
+    import aiohttp
+    AIOHTTP_AVAILABLE = True
+except ImportError:
+    AIOHTTP_AVAILABLE = False
 
 # C2PA imports (optional - will gracefully degrade if not installed)
 try:
@@ -124,6 +133,18 @@ class EncryptedStr(str):
                 lambda instance: str(instance)
             ),
         )
+
+
+# Pre-compiled regex patterns for performance
+RE_ASPECT_SQUARE = re.compile(r"\bsquare\b", re.IGNORECASE)
+RE_ASPECT_ULTRAWIDE = re.compile(r"\bultrawide\b", re.IGNORECASE)
+RE_ASPECT_PORTRAIT = re.compile(r"\b(portrait|vertical|tall)\b", re.IGNORECASE)
+RE_ASPECT_LANDSCAPE = re.compile(r"\b(landscape|wide|cinematic)\b", re.IGNORECASE)
+RE_ASPECT_CLASSIC = re.compile(r"\bclassic\b", re.IGNORECASE)
+RE_ASPECT_NUMERIC = re.compile(r"(\d{1,3})\s*[:xX\/]\s*(\d{1,3})")
+RE_RESOLUTION = re.compile(r"\b([124])\s*k\b", re.IGNORECASE)
+RE_FILE_ID = re.compile(r"/api/v1/files/([a-f0-9\-]+)/content", re.IGNORECASE)
+RE_SUPPORT_CODES = re.compile(r"(?:support code|code)s?\s*:?\s*(\d{8})", re.IGNORECASE)
 
 
 class Pipe:
@@ -261,6 +282,10 @@ class Pipe:
         self.name = "Gemini 3 Pro Image"
         self.valves = self.Valves()
         self.last_emit_time = 0
+        
+        # Cache for Vertex AI credentials to avoid temp file creation per request
+        self._cached_creds_path: Optional[str] = None
+        self._cached_creds_hash: Optional[str] = None
 
         # Auto-migrate old configurations to Gemini 3 Pro defaults
         migrations = []
@@ -317,6 +342,42 @@ class Pipe:
         if getattr(self.valves, "debug", False):
             print(f"[DEBUG] {msg}")
 
+    def _get_cached_credentials_path(self) -> Optional[str]:
+        """Get or create cached credentials file for Vertex AI.
+        
+        Returns the path to the credentials file, reusing cached version if unchanged.
+        """
+        if not self.valves.SERVICE_ACCOUNT_JSON:
+            return None
+        
+        # Get decrypted JSON and compute hash
+        service_account_json = self.valves.SERVICE_ACCOUNT_JSON.get_decrypted()
+        creds_hash = hashlib.sha256(service_account_json.encode()).hexdigest()[:16]
+        
+        # Check if we have a valid cached file
+        if (self._cached_creds_path and 
+            self._cached_creds_hash == creds_hash and 
+            os.path.exists(self._cached_creds_path)):
+            self._debug(f"Using cached credentials file: {self._cached_creds_path}")
+            return self._cached_creds_path
+        
+        # Clean up old cached file if exists
+        if self._cached_creds_path and os.path.exists(self._cached_creds_path):
+            try:
+                os.unlink(self._cached_creds_path)
+            except Exception:
+                pass
+        
+        # Create new cached credentials file
+        service_account_info = json.loads(service_account_json)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(service_account_info, f)
+            self._cached_creds_path = f.name
+            self._cached_creds_hash = creds_hash
+        
+        self._debug(f"Created new credentials file: {self._cached_creds_path}")
+        return self._cached_creds_path
+
     def _detect_edit_mode_from_prompt(self, prompt: str) -> bool:
         """Detect if user wants edit mode from their prompt.
         
@@ -363,8 +424,13 @@ class Pipe:
         level: str,
         message: str,
         done: bool = False,
+        force: bool = False,
     ) -> None:
-        """Emit status updates to Open WebUI"""
+        """Emit status updates to Open WebUI
+        
+        Args:
+            force: If True, bypass throttle interval (use for thinking updates)
+        """
         if not event_emitter:
             self._debug(f"emit_status: No event_emitter available")
             return
@@ -375,9 +441,9 @@ class Pipe:
 
         current_time = time.time()
         time_since_last = current_time - self.last_emit_time
-        should_emit = time_since_last >= self.valves.EMIT_INTERVAL or done
+        should_emit = force or time_since_last >= self.valves.EMIT_INTERVAL or done
         
-        self._debug(f"emit_status: msg='{message[:50]}...' done={done} should_emit={should_emit} (interval={time_since_last:.2f}s)")
+        self._debug(f"emit_status: msg='{message[:50]}...' done={done} force={force} should_emit={should_emit} (interval={time_since_last:.2f}s)")
         
         if should_emit:
             try:
@@ -533,7 +599,7 @@ class Pipe:
     def _extract_support_codes(self, message: str) -> list[str]:
         if not message or not isinstance(message, str):
             return []
-        return re.findall(r"(?:support code|code)s?\s*:?\s*(\d{8})", message, re.IGNORECASE)
+        return RE_SUPPORT_CODES.findall(message)
 
     def _format_policy_guardrails_message(
         self,
@@ -894,7 +960,6 @@ class Pipe:
             
         except Exception as e:
             self._debug(f"C2PA signing failed: {e}")
-            import traceback
             self._debug(f"C2PA traceback: {traceback.format_exc()}")
             # Return original unsigned image on error
             return image_data
@@ -1092,7 +1157,7 @@ class Pipe:
                 "info",
                 "Building context from conversation history...",
             )
-            contents = self._build_gemini_context(messages, prompt, __request__, prompt_requests_edit)
+            contents = await self._build_gemini_context(messages, prompt, __request__, prompt_requests_edit)
 
             # Generate with Gemini - create client based on authentication mode
             if self.valves.use_vertex_ai:
@@ -1108,25 +1173,13 @@ class Pipe:
                 )
 
                 # For Vertex AI with service account, set credentials via environment
-                # Keep them set for the entire operation duration
-                import tempfile
-
+                # Use cached credentials file to avoid temp file creation per request
                 if self.valves.SERVICE_ACCOUNT_JSON:
-                    service_account_json = (
-                        self.valves.SERVICE_ACCOUNT_JSON.get_decrypted()
-                    )
-                    service_account_info = json.loads(service_account_json)
-
-                    # Write to temp file and set environment variable
-                    with tempfile.NamedTemporaryFile(
-                        mode="w", suffix=".json", delete=False
-                    ) as f:
-                        json.dump(service_account_info, f)
-                        temp_creds_path = f.name
-
-                    # Set environment variable - will be cleaned up in finally block
-                    old_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-                    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_creds_path
+                    cached_path = self._get_cached_credentials_path()
+                    if cached_path:
+                        old_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+                        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cached_path
+                        # Don't set temp_creds_path - we don't want to delete cached file
                 else:
                     # Use SERVICE_ACCOUNT_PATH directly
                     old_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
@@ -1179,8 +1232,6 @@ class Pipe:
                         self._debug(f"No aspect ratio detected in prompt")
                 except Exception as e:
                     self._debug(f"Failed to extract aspect ratio from prompt: {e}")
-                    import traceback
-
                     self._debug(traceback.format_exc())
 
             if not _res:
@@ -1193,8 +1244,6 @@ class Pipe:
                         self._debug(f"No resolution detected in prompt")
                 except Exception as e:
                     self._debug(f"Failed to extract resolution from prompt: {e}")
-                    import traceback
-
                     self._debug(traceback.format_exc())
 
             # Try to apply aspect_ratio and/or resolution using ImageConfig per official docs
@@ -1247,8 +1296,6 @@ class Pipe:
                         self._debug(f"✓ Applied ImageConfig with {config_desc}")
                     except Exception as e:
                         self._debug(f"❌ Failed to create ImageConfig: {e}")
-                        import traceback
-
                         self._debug(traceback.format_exc())
                 else:
                     self._debug(
@@ -1260,7 +1307,7 @@ class Pipe:
             self._debug(f"Final GenerateContentConfig: {generate_content_config}")
 
             await self.emit_status(
-                __event_emitter__, "info", "Generating image with Gemini..."
+                __event_emitter__, "info", "Generating image with Gemini...", force=True
             )
 
             # Generate content using streaming with keepalive status updates
@@ -1292,26 +1339,29 @@ class Pipe:
             generation_task = loop.run_in_executor(None, run_generation)
 
             # Send keepalive status updates while waiting for generation
+            # Only show "Still generating..." if no chunks received yet (thinking updates will take over)
             status_intervals = [15, 30, 45, 60, 90, 120]  # seconds
             next_status_index = 0
             
             while not generation_task.done():
-                elapsed = int(time.time() - generation_start_time)
+                elapsed = time.time() - generation_start_time
+                elapsed_int = int(elapsed)
                 
-                # Send periodic status updates to keep WebSocket alive
-                if next_status_index < len(status_intervals):
-                    if elapsed >= status_intervals[next_status_index]:
+                # Only send keepalive if no chunks received yet (model thinking updates will provide feedback)
+                if not chunks_queue:
+                    if next_status_index < len(status_intervals):
+                        if elapsed_int >= status_intervals[next_status_index]:
+                            await self.emit_status(
+                                __event_emitter__, "info", f"Still generating image... ({elapsed_int}s elapsed)"
+                            )
+                            next_status_index += 1
+                    elif elapsed_int % 60 == 0 and elapsed_int > 0:
+                        # After all intervals, update every minute
                         await self.emit_status(
-                            __event_emitter__, "info", f"Still generating image... ({elapsed}s elapsed)"
+                            __event_emitter__, "info", f"Still generating image... ({elapsed_int}s elapsed)"
                         )
-                        next_status_index += 1
-                elif elapsed % 60 == 0 and elapsed > 0:
-                    # After all intervals, update every minute
-                    await self.emit_status(
-                        __event_emitter__, "info", f"Still generating image... ({elapsed}s elapsed)"
-                    )
                 
-                await asyncio.sleep(1)  # Check every second
+                await asyncio.sleep(0.1)  # Check every 100ms for faster response
             
             # Wait for generation to complete
             await generation_task
@@ -1349,6 +1399,22 @@ class Pipe:
 
                     parts = chunk.candidates[0].content.parts
                     self._debug(f"Processing {len(parts)} parts in chunk")
+
+                    # Check for thinking/reasoning parts and show as status updates
+                    for part in parts:
+                        if getattr(part, "thought", False) and getattr(part, "text", None):
+                            # Extract a short summary from the thinking text
+                            thought_text = part.text.strip()
+                            # Get the title (first line, usually bold like "**Defining the Scene**")
+                            first_line = thought_text.split("\n")[0].strip()
+                            # Remove markdown bold markers
+                            title = first_line.replace("**", "").strip()
+                            if title:
+                                # Force emit thinking updates (bypass throttle)
+                                await self.emit_status(
+                                    __event_emitter__, "info", f"{title}...", force=True
+                                )
+                                self._debug(f"Thinking: {title}")
 
                     finish_reason = self._get_finish_reason(chunk.candidates[0])
                     if finish_reason:
@@ -1546,8 +1612,6 @@ class Pipe:
         except Exception as e:
             error_msg = f"Error during image generation: {str(e)}"
             self._debug(f"Exception occurred: {error_msg}")
-            import traceback
-
             self._debug(f"Traceback: {traceback.format_exc()}")
 
             await self.emit_status(__event_emitter__, "error", error_msg, True)
@@ -1631,23 +1695,13 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                         "GOOGLE_CLOUD_LOCATION", "us-central1"
                     )
 
-                    import tempfile
-
-                    temp_creds_path = None
                     old_creds = None
 
                     if self.valves.SERVICE_ACCOUNT_JSON:
-                        service_account_json = (
-                            self.valves.SERVICE_ACCOUNT_JSON.get_decrypted()
-                        )
-                        service_account_info = json.loads(service_account_json)
-                        with tempfile.NamedTemporaryFile(
-                            mode="w", suffix=".json", delete=False
-                        ) as f:
-                            json.dump(service_account_info, f)
-                            temp_creds_path = f.name
-                        old_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-                        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp_creds_path
+                        cached_path = self._get_cached_credentials_path()
+                        if cached_path:
+                            old_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+                            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cached_path
                     else:
                         old_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
                         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
@@ -1666,11 +1720,6 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                             os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = old_creds
                         elif "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
                             os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
-                        if temp_creds_path:
-                            try:
-                                os.unlink(temp_creds_path)
-                            except:
-                                pass
                 else:
                     api_key = self.valves.api_key.get_decrypted()
                     client = genai.Client(api_key=api_key)
@@ -1795,6 +1844,9 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
 
         return "", False
 
+    # Valid aspect ratios for Gemini 3 Pro Image
+    VALID_RATIOS = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+
     def _extract_aspect_ratio_from_prompt(self, text: str) -> str:
         """Extract an aspect ratio hint from freeform prompt text.
 
@@ -1808,39 +1860,24 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
 
         Returns normalized form like '16:9' or empty string if none.
         """
-        # Gemini 3 Pro Image supported aspect ratios
-        VALID_RATIOS = {
-            "1:1",
-            "2:3",
-            "3:2",
-            "3:4",
-            "4:3",
-            "4:5",
-            "5:4",
-            "9:16",
-            "16:9",
-            "21:9",
-        }
-
         try:
             if not isinstance(text, str) or not text.strip():
                 return ""
-            s = text.lower()
 
-            # Keyword mappings first (common quick wins)
-            if re.search(r"\bsquare\b", s):
+            # Keyword mappings first (common quick wins) - use pre-compiled patterns
+            if RE_ASPECT_SQUARE.search(text):
                 return "1:1"
-            if re.search(r"\bultrawide\b", s):
+            if RE_ASPECT_ULTRAWIDE.search(text):
                 return "21:9"
-            if re.search(r"\b(portrait|vertical|tall)\b", s):
+            if RE_ASPECT_PORTRAIT.search(text):
                 return "9:16"
-            if re.search(r"\b(landscape|wide|cinematic)\b", s):
+            if RE_ASPECT_LANDSCAPE.search(text):
                 return "16:9"
-            if re.search(r"\bclassic\b", s):
+            if RE_ASPECT_CLASSIC.search(text):
                 return "4:3"
 
             # Numeric pattern: allow '16:9', '16 x 9', '16x9', '16 / 9'
-            m = re.search(r"(\d{1,3})\s*[:xX\/]\s*(\d{1,3})", s)
+            m = RE_ASPECT_NUMERIC.search(text)
             if m:
                 a, b = m.group(1), m.group(2)
                 try:
@@ -1848,15 +1885,13 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                     bi = int(b)
                     if ai > 0 and bi > 0:
                         # Normalize to simplest terms (e.g., 1080x1920 -> 9:16)
-                        from math import gcd
-
                         g = gcd(ai, bi)
                         ai //= g
                         bi //= g
                         ratio = f"{ai}:{bi}"
 
                         # Validate against SDK's supported ratios
-                        if ratio in VALID_RATIOS:
+                        if ratio in self.VALID_RATIOS:
                             self._debug(f"Validated ratio: {ratio}")
                             return ratio
                         else:
@@ -1868,6 +1903,9 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
             return ""
         except Exception:
             return ""
+
+    # Valid resolutions for Gemini 3 Pro Image
+    VALID_RESOLUTIONS = {"1K", "2K", "4K"}
 
     def _extract_resolution_from_prompt(self, text: str) -> str:
         """Extract resolution hint from freeform prompt text.
@@ -1881,17 +1919,15 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
 
         Returns normalized form like '2K' or empty string if none.
         """
-        VALID_RESOLUTIONS = {"1K", "2K", "4K"}
-
         try:
             if not isinstance(text, str) or not text.strip():
                 return ""
 
             # Look for resolution patterns: 1K, 2K, 4K (case insensitive, optional whitespace)
-            m = re.search(r"\b([124])\s*k\b", text, re.IGNORECASE)
+            m = RE_RESOLUTION.search(text)
             if m:
                 res = f"{m.group(1)}K"
-                if res in VALID_RESOLUTIONS:
+                if res in self.VALID_RESOLUTIONS:
                     self._debug(f"Validated resolution: {res}")
                     return res
 
@@ -1962,7 +1998,7 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                 return True
         return False
 
-    def _build_gemini_context(
+    async def _build_gemini_context(
         self, messages: List[Dict], current_prompt: str, request: Any, prompt_requests_edit: bool = False
     ) -> List[types.Content]:
         """Build the Gemini content list from conversation history.
@@ -1989,7 +2025,6 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
             return contents
 
         # Gather image URLs from history, most recent first
-        collected_images: List[Dict[str, bytes]] = []
         # Determine if we should use edit mode:
         # - Valve setting (self.valves.edit_mode) OR
         # - Auto-detected from prompt (prompt_requests_edit)
@@ -2006,26 +2041,19 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
             f"Image collection: edit_mode={use_edit_mode} ({edit_mode_source}), max_images={max_images}"
         )
 
-        def try_add_image(url: str):
-            nonlocal collected_images
-            if len(collected_images) >= max_images:
-                return
-            data = self._download_image(url, request)
-            if data:
-                collected_images.append(data)
-
-        # Walk messages from latest to oldest to prioritize the most recent images
+        # Collect image URLs from history (most recent first)
+        image_urls: List[str] = []
         for msg in reversed(messages):
-            if len(collected_images) >= max_images:
+            if len(image_urls) >= max_images:
                 break
             role = msg.get("role", "")
             content = msg.get("content", "")
 
             if role == "assistant" and isinstance(content, str):
                 for url in self._extract_images_from_content(content):
-                    if len(collected_images) >= max_images:
+                    if len(image_urls) >= max_images:
                         break
-                    try_add_image(url)
+                    image_urls.append(url)
 
             elif role == "user":
                 # User may have provided images via multimodal message format
@@ -2033,10 +2061,20 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                     for item in content:
                         if isinstance(item, dict) and item.get("type") == "image_url":
                             url = item.get("image_url", {}).get("url", "")
-                            if url:
-                                try_add_image(url)
-                            if len(collected_images) >= max_images:
-                                break
+                            if url and len(image_urls) < max_images:
+                                image_urls.append(url)
+
+        # Download images in parallel using async
+        collected_images: List[Dict[str, bytes]] = []
+        if image_urls:
+            self._debug(f"Downloading {len(image_urls)} images in parallel...")
+            download_tasks = [self._download_image_async(url, request) for url in image_urls]
+            results = await asyncio.gather(*download_tasks, return_exceptions=True)
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    self._debug(f"Image download failed for {image_urls[i]}: {result}")
+                elif result is not None:
+                    collected_images.append(result)
 
         # Build a single user content with optional guidance + selected images + current prompt
         parts: List[types.Part] = []
@@ -2182,9 +2220,7 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                             f"HTTP transient error {response.status_code}: {response.text[:200]}"
                         )
                         if attempt < attempts:
-                            import time as _t
-
-                            _t.sleep(backoff)
+                            time.sleep(backoff)
                             backoff *= float(
                                 getattr(self.valves, "retry_backoff_base", 1.5)
                             )
@@ -2195,9 +2231,7 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
                 except Exception as ex:
                     self._debug(f"Download attempt {attempt} failed: {ex}")
                     if attempt < attempts:
-                        import time as _t
-
-                        _t.sleep(backoff)
+                        time.sleep(backoff)
                         backoff *= float(
                             getattr(self.valves, "retry_backoff_base", 1.5)
                         )
@@ -2217,4 +2251,120 @@ JSON: { "follow_ups": ["Prompt 1", "Prompt 2", "Prompt 3"] }
             return {"data": response.content, "mime_type": mime_type}
         except Exception as e:
             self._debug(f"Failed to download image {image_url}: {e}")
+            return None
+
+    async def _download_image_async(
+        self, image_url: str, request: Optional[Any] = None
+    ) -> Optional[Dict]:
+        """Async version of _download_image using aiohttp for parallel downloads.
+
+        Falls back to sync version if aiohttp is not available.
+        """
+        # Handle data URIs synchronously (no network needed)
+        if image_url.startswith("data:"):
+            try:
+                header, data = image_url.split(",", 1)
+                mime_type = header.split(";")[0].split(":")[1]
+                image_data = base64.b64decode(data)
+                return {"data": image_data, "mime_type": mime_type}
+            except Exception as e:
+                self._debug(f"Failed to decode data URI: {e}")
+                return None
+
+        # Handle Open WebUI file URLs by ID (bypass HTTP - local file read)
+        try:
+            m = RE_FILE_ID.search(image_url)
+            if m:
+                file_id = m.group(1)
+                file_model = FilesDB.get_file_by_id(file_id)
+                if file_model and file_model.path:
+                    local_path = Storage.get_file(file_model.path)
+                    with open(local_path, "rb") as f:
+                        data_bytes = f.read()
+                    mime_type = None
+                    if file_model.meta and isinstance(file_model.meta, dict):
+                        mime_type = file_model.meta.get("content_type") or file_model.meta.get("mime_type")
+                    if not mime_type:
+                        mime_type = mimetypes.guess_type(file_model.filename or local_path)[0] or "image/png"
+                    return {"data": data_bytes, "mime_type": mime_type}
+        except Exception as e:
+            self._debug(f"Direct file read by ID failed, will try URL resolution: {e}")
+
+        # Resolve site-relative URLs
+        resolved_url = image_url
+        if image_url.startswith("/"):
+            base = os.getenv("WEBUI_URL", "").rstrip("/")
+            if not base and request is not None:
+                try:
+                    proto = request.headers.get("x-forwarded-proto")
+                    host = request.headers.get("x-forwarded-host") or request.headers.get("host")
+                    if proto and host:
+                        base = f"{proto}://{host}"
+                    else:
+                        base = str(getattr(request, "base_url", "")).rstrip("/")
+                except Exception:
+                    base = ""
+            if base:
+                resolved_url = f"{base}{image_url}"
+            else:
+                self._debug(f"Cannot resolve relative URL (no WEBUI_URL or request base). Skipping: {image_url}")
+                return None
+
+        # Prepare headers from incoming request for authenticated endpoints
+        headers = {}
+        try:
+            if request is not None and getattr(request, "headers", None):
+                auth = request.headers.get("authorization")
+                cookie = request.headers.get("cookie")
+                if auth:
+                    headers["Authorization"] = auth
+                if cookie:
+                    headers["Cookie"] = cookie
+        except Exception:
+            pass
+
+        # Use aiohttp if available, otherwise fall back to sync requests
+        if not AIOHTTP_AVAILABLE:
+            self._debug("aiohttp not available, using sync download")
+            return self._download_image(image_url, request)
+
+        # Async HTTP download with aiohttp
+        timeout_val = max(1, int(getattr(self.valves, "download_timeout", 20)))
+        attempts = max(1, int(getattr(self.valves, "retry_attempts", 3)))
+        backoff = 1.0
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_val)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                for attempt in range(1, attempts + 1):
+                    try:
+                        async with session.get(resolved_url, headers=headers or None) as response:
+                            if response.status in (429,) or 500 <= response.status <= 599:
+                                self._debug(f"HTTP transient error {response.status}")
+                                if attempt < attempts:
+                                    await asyncio.sleep(backoff)
+                                    backoff *= float(getattr(self.valves, "retry_backoff_base", 1.5))
+                                    continue
+                                response.raise_for_status()
+                            response.raise_for_status()
+                            
+                            content = await response.read()
+                            content_type = response.headers.get("content-type", "")
+                            if not content_type.startswith("image/"):
+                                mime_type = mimetypes.guess_type(resolved_url)[0]
+                                if not mime_type or not mime_type.startswith("image/"):
+                                    mime_type = "image/png"
+                            else:
+                                mime_type = content_type
+                            
+                            return {"data": content, "mime_type": mime_type}
+                    except aiohttp.ClientError as ex:
+                        self._debug(f"Async download attempt {attempt} failed: {ex}")
+                        if attempt < attempts:
+                            await asyncio.sleep(backoff)
+                            backoff *= float(getattr(self.valves, "retry_backoff_base", 1.5))
+                            continue
+                        raise
+        except Exception as e:
+            self._debug(f"Async download failed for {resolved_url}: {e}")
             return None
