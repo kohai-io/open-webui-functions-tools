@@ -1,8 +1,8 @@
 """
 title: Note Manager
 author: open-webui
-version: 1.0.6
-description: Allows models to read, update, and append to Open WebUI notes. Enables AI-driven note management during conversations.
+version: 1.3.0
+description: Allows models to read, create, update, and append to Open WebUI notes. Enables AI-driven note management during conversations.
 required_open_webui_version: 0.3.9
 """
 
@@ -107,6 +107,28 @@ class Tools:
             html_parts.append('</ul>')
         
         return ''.join(html_parts)
+
+    def _save_version(self, note) -> list:
+        """
+        Save current note content to version history before making changes.
+        Returns the updated versions list.
+        """
+        versions = []
+        if note.data and isinstance(note.data, dict):
+            versions = note.data.get("versions", []) or []
+            content_obj = note.data.get("content", {})
+            if isinstance(content_obj, dict):
+                current_version = {
+                    "json": content_obj.get("json"),
+                    "html": content_obj.get("html", ""),
+                    "md": content_obj.get("md", "")
+                }
+                # Only add if there's actual content and it's different from last version
+                if current_version.get("md") or current_version.get("html"):
+                    last_version = versions[-1] if versions else None
+                    if not last_version or last_version.get("md") != current_version.get("md"):
+                        versions.append(current_version)
+        return versions
 
     async def get_note(
         self,
@@ -227,6 +249,87 @@ class Tools:
             log.error(f"[NOTE MANAGER] Error listing notes: {e}")
             return f"❌ Error listing notes: {str(e)}"
 
+    async def create_note(
+        self,
+        title: str,
+        content: str = "",
+        __user__: dict = None,
+        __event_emitter__: callable = None,
+    ) -> str:
+        """
+        Create a new note with the given title and optional content.
+        
+        This function requires ALLOW_CREATE to be enabled in the tool's valves/settings.
+        
+        :param title: The title for the new note
+        :param content: Optional initial content for the note (markdown format)
+        :return: Success message with the new note ID, or error message
+        """
+        try:
+            # Check if creation is allowed
+            if not self.valves.ALLOW_CREATE:
+                return "❌ Note creation is disabled. Enable ALLOW_CREATE in the tool settings to allow models to create notes."
+            
+            from open_webui.models.notes import Notes, NoteForm
+            
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": "Creating note...", "done": False}
+                })
+            
+            user_id = __user__.get("id") if __user__ else None
+            
+            if not user_id:
+                return "❌ User ID not available. Cannot create note."
+            
+            if not title or len(title.strip()) == 0:
+                return "❌ Title cannot be empty."
+            
+            if len(title) > 200:
+                return "❌ Title too long. Maximum 200 characters."
+            
+            if len(content) > self.valves.MAX_CONTENT_LENGTH:
+                return f"❌ Content too long. Maximum {self.valves.MAX_CONTENT_LENGTH} characters allowed."
+            
+            # Convert markdown to TipTap HTML
+            html_content = self._markdown_to_tiptap_html(content) if content else ""
+            
+            # Create the note with proper data structure
+            form_data = NoteForm(
+                title=title.strip(),
+                data={
+                    "content": {
+                        "md": content,
+                        "html": html_content,
+                        "json": None
+                    },
+                    "versions": [],
+                    "files": None
+                },
+                meta={},
+                access_control={},
+            )
+            
+            new_note = Notes.insert_new_note(form_data, user_id)
+            
+            if not new_note:
+                return "❌ Failed to create note."
+            
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": "Note created successfully", "done": True}
+                })
+            
+            log.info(f"[NOTE MANAGER] Created note {new_note.id} '{title}' for user {user_id}")
+            
+            return f"✅ Note **{title}** created successfully.\n\n**Note ID:** `{new_note.id}`\n\nYou can now use this ID to update or append to the note."
+            
+        except Exception as e:
+            log.error(f"[NOTE MANAGER] Error creating note: {e}")
+            return f"❌ Error creating note: {str(e)}"
+
     async def update_note(
         self,
         note_id: str,
@@ -269,6 +372,9 @@ class Tools:
                 if not has_access(user_id, type="write", access_control=note.access_control):
                     return "❌ You don't have permission to update this note."
             
+            # Save current content to version history before updating
+            versions = self._save_version(note)
+            
             # Update the note using NoteUpdateForm
             # Notes use a complex structure: data.content = {json, html, md}
             # The editor uses TipTap with TaskList extension
@@ -280,7 +386,8 @@ class Tools:
                         "md": new_content,
                         "html": html_content,
                         "json": None
-                    }
+                    },
+                    "versions": versions
                 },
             )
             
@@ -340,6 +447,9 @@ class Tools:
                 if not has_access(user_id, type="write", access_control=note.access_control):
                     return "❌ You don't have permission to update this note."
             
+            # Save current content to version history before updating
+            versions = self._save_version(note)
+            
             # Get existing content
             # Notes use structure: data.content = {json, html, md}
             existing_content = ""
@@ -374,7 +484,8 @@ class Tools:
                         "md": new_content,
                         "html": html_content,
                         "json": None
-                    }
+                    },
+                    "versions": versions
                 },
             )
             
@@ -458,3 +569,188 @@ class Tools:
         except Exception as e:
             log.error(f"[NOTE MANAGER] Error updating note title: {e}")
             return f"❌ Error updating note title: {str(e)}"
+
+    async def delete_note(
+        self,
+        note_id: str,
+        __user__: dict = None,
+        __event_emitter__: callable = None,
+    ) -> str:
+        """
+        Delete a note permanently.
+        
+        This function requires ALLOW_DELETE to be enabled in the tool's valves/settings.
+        WARNING: This action cannot be undone!
+        
+        :param note_id: The ID of the note to delete
+        :return: Success or error message
+        """
+        try:
+            # Check if deletion is allowed
+            if not self.valves.ALLOW_DELETE:
+                return "❌ Note deletion is disabled. Enable ALLOW_DELETE in the tool settings to allow models to delete notes."
+            
+            from open_webui.models.notes import Notes
+            from open_webui.utils.access_control import has_access
+            
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": "Deleting note...", "done": False}
+                })
+            
+            user_id = __user__.get("id") if __user__ else None
+            user_role = __user__.get("role", "user") if __user__ else "user"
+            
+            note = Notes.get_note_by_id(note_id)
+            if not note:
+                return f"❌ Note not found: {note_id}"
+            
+            # Check write access (only owner or admin can delete)
+            if user_role != "admin" and user_id != note.user_id:
+                return "❌ You don't have permission to delete this note. Only the owner can delete it."
+            
+            title = note.title
+            Notes.delete_note_by_id(note_id)
+            
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": "Note deleted", "done": True}
+                })
+            
+            log.info(f"[NOTE MANAGER] Note {note_id} '{title}' deleted by user {user_id}")
+            
+            return f"✅ Note **{title}** deleted successfully."
+            
+        except Exception as e:
+            log.error(f"[NOTE MANAGER] Error deleting note: {e}")
+            return f"❌ Error deleting note: {str(e)}"
+
+    async def search_notes(
+        self,
+        query: str,
+        __user__: dict = None,
+        __event_emitter__: callable = None,
+    ) -> str:
+        """
+        Search notes by title.
+        
+        :param query: Search query to match against note titles
+        :return: List of matching notes with their IDs
+        """
+        try:
+            from open_webui.models.notes import Notes
+            
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": "Searching notes...", "done": False}
+                })
+            
+            user_id = __user__.get("id") if __user__ else None
+            
+            # Get all accessible notes and filter by query
+            notes = Notes.get_notes_by_permission(user_id, "read")
+            
+            query_lower = query.lower()
+            matching_notes = [
+                note for note in notes 
+                if query_lower in note.title.lower()
+            ]
+            
+            if __event_emitter__:
+                await __event_emitter__({
+                    "type": "status",
+                    "data": {"description": f"Found {len(matching_notes)} matching notes", "done": True}
+                })
+            
+            if not matching_notes:
+                return f"📝 No notes found matching '{query}'."
+            
+            result = f"## 🔍 Notes matching '{query}'\n\n"
+            result += "| Title | ID | Updated |\n"
+            result += "|-------|----|---------|\n"
+            
+            for note in matching_notes[:20]:  # Limit to 20 results
+                updated = time.strftime('%Y-%m-%d', time.localtime(note.updated_at / 1000000000))
+                title = note.title[:40] + "..." if len(note.title) > 40 else note.title
+                result += f"| {title} | `{note.id}` | {updated} |\n"
+            
+            if len(matching_notes) > 20:
+                result += f"\n*...and {len(matching_notes) - 20} more matches*"
+            
+            return result
+            
+        except Exception as e:
+            log.error(f"[NOTE MANAGER] Error searching notes: {e}")
+            return f"❌ Error searching notes: {str(e)}"
+
+    async def help(
+        self,
+        __user__: dict = None,
+        __event_emitter__: callable = None,
+    ) -> str:
+        """
+        Show available Note Manager capabilities and usage examples.
+        
+        :return: Help text describing all available functions
+        """
+        create_status = "✅ Enabled" if self.valves.ALLOW_CREATE else "❌ Disabled"
+        delete_status = "✅ Enabled" if self.valves.ALLOW_DELETE else "❌ Disabled"
+        
+        return f"""## 📝 Note Manager - Available Functions
+
+### Reading Notes
+| Function | Description |
+|----------|-------------|
+| `list_my_notes()` | List all notes you have access to |
+| `get_note(note_id)` | Read the content of a specific note |
+| `search_notes(query)` | Search notes by title |
+
+### Creating Notes
+| Function | Description | Status |
+|----------|-------------|--------|
+| `create_note(title, content)` | Create a new note | {create_status} |
+
+### Updating Notes
+| Function | Description |
+|----------|-------------|
+| `update_note(note_id, new_content)` | Replace entire note content |
+| `append_to_note(note_id, content, add_timestamp)` | Add content to end of note |
+| `update_note_title(note_id, new_title)` | Change a note's title |
+
+### Deleting Notes
+| Function | Description | Status |
+|----------|-------------|--------|
+| `delete_note(note_id)` | Permanently delete a note | {delete_status} |
+
+---
+
+### 💡 Usage Examples
+
+**List your notes:**
+> "Show me my notes" or "List my notes"
+
+**Read a note:**
+> "What's in my Todo note?" or "Read note abc-123"
+
+**Create a note:**
+> "Create a new note called 'Meeting Notes' with a task list"
+
+**Update a note:**
+> "Add 'Buy groceries' to my Todo note"
+> "Mark the first item on my Todo as complete"
+
+**Search notes:**
+> "Find notes about meetings"
+
+---
+
+### ⚙️ Settings
+- **ALLOW_CREATE:** {create_status} - Controls whether new notes can be created
+- **ALLOW_DELETE:** {delete_status} - Controls whether notes can be deleted
+- **MAX_CONTENT_LENGTH:** {self.valves.MAX_CONTENT_LENGTH:,} characters
+
+*Settings can be changed in Workspace → Tools → Note Manager → Valves*
+"""
