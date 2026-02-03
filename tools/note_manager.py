@@ -1,7 +1,7 @@
 """
 title: Note Manager
 author: open-webui
-version: 1.4.0
+version: 1.4.1
 description: Allows models to read, create, update, and append to Open WebUI notes. Enables AI-driven note management during conversations.
 required_open_webui_version: 0.3.9
 """
@@ -709,13 +709,14 @@ class Tools:
             log.error(f"[NOTE MANAGER] Error searching notes: {e}")
             return f"❌ Error searching notes: {str(e)}"
 
-    async def help(
+    async def get_note_manager_capabilities(
         self,
         __user__: dict = None,
         __event_emitter__: callable = None,
     ) -> str:
         """
         Show available Note Manager capabilities and usage examples.
+        Call this when the user asks what you can do with notes or needs help with note management.
         
         :return: Help text describing all available functions
         """
