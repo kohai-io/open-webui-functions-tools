@@ -1,7 +1,7 @@
 """
 title: Note Manager
 author: open-webui
-version: 1.3.0
+version: 1.4.0
 description: Allows models to read, create, update, and append to Open WebUI notes. Enables AI-driven note management during conversations.
 required_open_webui_version: 0.3.9
 """
@@ -630,14 +630,16 @@ class Tools:
     async def search_notes(
         self,
         query: str,
+        search_content: bool = True,
         __user__: dict = None,
         __event_emitter__: callable = None,
     ) -> str:
         """
-        Search notes by title.
+        Search notes by title and optionally content.
         
-        :param query: Search query to match against note titles
-        :return: List of matching notes with their IDs
+        :param query: Search query to match against note titles and content
+        :param search_content: If True, also search within note content (default: True)
+        :return: List of matching notes with their IDs and match location
         """
         try:
             from open_webui.models.notes import Notes
@@ -650,14 +652,34 @@ class Tools:
             
             user_id = __user__.get("id") if __user__ else None
             
-            # Get all accessible notes and filter by query
+            # Get all accessible notes
             notes = Notes.get_notes_by_permission(user_id, "read")
             
             query_lower = query.lower()
-            matching_notes = [
-                note for note in notes 
-                if query_lower in note.title.lower()
-            ]
+            matching_notes = []
+            
+            for note in notes:
+                match_type = None
+                
+                # Check title
+                if query_lower in note.title.lower():
+                    match_type = "title"
+                
+                # Check content if enabled
+                if search_content and not match_type:
+                    content = ""
+                    if note.data and isinstance(note.data, dict):
+                        content_obj = note.data.get("content", {})
+                        if isinstance(content_obj, dict):
+                            content = content_obj.get("md", "") or content_obj.get("html", "")
+                        elif isinstance(content_obj, str):
+                            content = content_obj
+                    
+                    if content and query_lower in content.lower():
+                        match_type = "content"
+                
+                if match_type:
+                    matching_notes.append((note, match_type))
             
             if __event_emitter__:
                 await __event_emitter__({
@@ -669,13 +691,14 @@ class Tools:
                 return f"📝 No notes found matching '{query}'."
             
             result = f"## 🔍 Notes matching '{query}'\n\n"
-            result += "| Title | ID | Updated |\n"
-            result += "|-------|----|---------|\n"
+            result += "| Title | Match | ID | Updated |\n"
+            result += "|-------|-------|----|---------|\n"
             
-            for note in matching_notes[:20]:  # Limit to 20 results
+            for note, match_type in matching_notes[:20]:  # Limit to 20 results
                 updated = time.strftime('%Y-%m-%d', time.localtime(note.updated_at / 1000000000))
-                title = note.title[:40] + "..." if len(note.title) > 40 else note.title
-                result += f"| {title} | `{note.id}` | {updated} |\n"
+                title = note.title[:35] + "..." if len(note.title) > 35 else note.title
+                match_icon = "📌" if match_type == "title" else "📄"
+                result += f"| {title} | {match_icon} {match_type} | `{note.id}` | {updated} |\n"
             
             if len(matching_notes) > 20:
                 result += f"\n*...and {len(matching_notes) - 20} more matches*"
@@ -706,7 +729,7 @@ class Tools:
 |----------|-------------|
 | `list_my_notes()` | List all notes you have access to |
 | `get_note(note_id)` | Read the content of a specific note |
-| `search_notes(query)` | Search notes by title |
+| `search_notes(query, search_content)` | Search notes by title and content |
 
 ### Creating Notes
 | Function | Description | Status |
