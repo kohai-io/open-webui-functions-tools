@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.0.1
+version: 1.0.2
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -341,7 +341,14 @@ class Pipe:
         domain = urlparse(url).netloc
         cookie_jar = aiohttp.CookieJar()
 
-        async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+        # Use realistic headers to avoid being blocked
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-GB,en;q=0.9",
+        }
+
+        async with aiohttp.ClientSession(cookie_jar=cookie_jar, headers=headers) as session:
             while to_visit and len(visited) < self.valves.MAX_PAGES:
                 current_url, depth = to_visit.pop(0)
 
@@ -353,8 +360,9 @@ class Pipe:
                 try:
                     await asyncio.sleep(self.valves.CRAWL_RATE_LIMIT)
 
-                    async with session.get(current_url, timeout=10) as response:
+                    async with session.get(current_url, timeout=10, ssl=False) as response:
                         if response.status != 200:
+                            log.debug(f"[CRAWL] {current_url} returned status {response.status}")
                             continue
 
                         content_type = response.headers.get("content-type", "")
@@ -399,10 +407,14 @@ class Pipe:
                                 if urlparse(absolute_url).netloc == domain:
                                     to_visit.append((absolute_url, depth + 1))
 
+                except asyncio.TimeoutError:
+                    log.warning(f"[CRAWL] Timeout fetching {current_url}")
+                    continue
                 except Exception as e:
-                    log.debug(f"Error crawling {current_url}: {e}")
+                    log.warning(f"[CRAWL] Error fetching {current_url}: {type(e).__name__}: {e}")
                     continue
 
+        log.info(f"[CRAWL] Complete: {len(pages)} pages, {len(collected_cookies)} cookies")
         return {"pages": pages, "cookies": collected_cookies}
 
     def analyze_cookies(self, cookies: Dict[str, Dict]) -> Dict[str, Any]:
