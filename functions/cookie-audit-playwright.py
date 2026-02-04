@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit (Playwright)
 author: Open WebUI
-version: 1.0.3
+version: 1.0.8
 license: MIT
 description: Advanced cookie compliance audit using Playwright for real browser rendering. Captures HTTP and JavaScript cookies, detects trackers using EasyPrivacy lists, analyzes third-party requests, and generates ICO PECR compliance reports. Based on EDPB Website Auditing Tool (EUPL-1.2).
 requirements: playwright, aiohttp, pydantic, adblockparser
@@ -142,6 +142,8 @@ class Pipe:
                     re.compile(r"^(JSESSIONID|SERVERID|ROUTEID|BACKEND).*$", re.IGNORECASE),
                     re.compile(r"^(incap_ses|visid_incap|nlbi_).*$", re.IGNORECASE),
                     re.compile(r"^(ak_bmsc|bm_sv|bm_sz).*$", re.IGNORECASE),
+                    # reCAPTCHA/bot protection (security/functional)
+                    re.compile(r"^(_GRECAPTCHA|__recaptcha|rc::|RECAPTCHA).*$", re.IGNORECASE),
                 ],
                 "description": "Strictly necessary for website functionality",
                 "requires_consent": False,
@@ -412,10 +414,24 @@ class Pipe:
             # Connect to remote browser or launch local
             if self.valves.PLAYWRIGHT_WS_URL:
                 log.info(f"[COOKIE AUDIT PW] Connecting to remote browser: {self.valves.PLAYWRIGHT_WS_URL}")
-                browser = p.chromium.connect(self.valves.PLAYWRIGHT_WS_URL)
+                # Try connect() first (works with run-server), fallback to connect_over_cdp() (works with launch-server)
+                try:
+                    browser = p.chromium.connect(self.valves.PLAYWRIGHT_WS_URL)
+                except Exception as e:
+                    log.warning(f"[COOKIE AUDIT PW] connect() failed, trying connect_over_cdp(): {e}")
+                    browser = p.chromium.connect_over_cdp(self.valves.PLAYWRIGHT_WS_URL)
             else:
                 log.info("[COOKIE AUDIT PW] Launching local browser")
-                browser = p.chromium.launch(headless=self.valves.HEADLESS)
+                # Launch with args to disable HTTP/2 and improve compatibility
+                browser = p.chromium.launch(
+                    headless=self.valves.HEADLESS,
+                    args=[
+                        "--disable-http2",  # Force HTTP/1.1 for problematic sites
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                    ]
+                )
             
             try:
                 # Create temp file for HAR
@@ -554,13 +570,20 @@ class Pipe:
                     log.warning(f"[COOKIE AUDIT PW] Could not access storage: {e}")
                 
                 # Detect consent mechanism
+                log.info("[COOKIE AUDIT PW] Detecting consent mechanism...")
                 consent_detected = self._detect_consent_mechanism_sync(page)
                 
                 # Look for cookie policy link
+                log.info("[COOKIE AUDIT PW] Looking for cookie policy link...")
                 cookie_policy_url = self._find_cookie_policy_link_sync(page, url)
+                log.info(f"[COOKIE AUDIT PW] Cookie policy search complete: {cookie_policy_url}")
                 
-                # Close context to finalize HAR
+                # Close page first to stop network activity, then context to finalize HAR
+                log.info("[COOKIE AUDIT PW] Closing page...")
+                page.close()
+                log.info("[COOKIE AUDIT PW] Closing browser context...")
                 context.close()
+                log.info("[COOKIE AUDIT PW] Browser context closed")
                 
                 # Read HAR file
                 if os.path.exists(har_path):
@@ -638,35 +661,41 @@ class Pipe:
         return False
 
     def _find_cookie_policy_link_sync(self, page, base_url: str) -> Optional[str]:
-        """Find cookie policy page link (sync version)"""
-        policy_patterns = [
-            r"cookie.*policy",
-            r"cookie.*notice",
-            r"privacy.*cookie",
-            r"cookies",
-        ]
+        """Find cookie policy page link (sync version)
         
+        Optimized to use JavaScript evaluation instead of iterating links individually
+        """
         try:
-            links = page.query_selector_all("a[href]")
-            for link in links:
-                href = link.get_attribute("href")
-                text = link.inner_text()
-                
-                if not href:
-                    continue
-                
-                href_lower = href.lower()
-                text_lower = text.lower()
-                
-                for pattern in policy_patterns:
-                    if re.search(pattern, href_lower) or re.search(pattern, text_lower):
-                        # Make absolute URL
-                        if href.startswith("/"):
-                            href = urljoin(base_url, href)
-                        elif not href.startswith("http"):
-                            href = urljoin(base_url, href)
-                        log.info(f"[COOKIE AUDIT PW] Cookie policy found: {href}")
-                        return href
+            # Use JS to find cookie policy links efficiently (avoids slow per-element calls)
+            result = page.evaluate("""() => {
+                const patterns = ['cookie', 'privacy'];
+                const links = Array.from(document.querySelectorAll('a[href]'));
+                for (const link of links) {
+                    const href = link.getAttribute('href') || '';
+                    const text = link.innerText || '';
+                    const hrefLower = href.toLowerCase();
+                    const textLower = text.toLowerCase();
+                    
+                    // Check if link relates to cookies/privacy
+                    if ((hrefLower.includes('cookie') || textLower.includes('cookie') ||
+                         hrefLower.includes('privacy') || textLower.includes('privacy')) &&
+                        (hrefLower.includes('policy') || hrefLower.includes('notice') ||
+                         textLower.includes('policy') || textLower.includes('notice') ||
+                         hrefLower.match(/\\/cookies?\\/?$/))) {
+                        return href;
+                    }
+                }
+                return null;
+            }""")
+            
+            if result:
+                # Make absolute URL
+                if result.startswith("/"):
+                    result = urljoin(base_url, result)
+                elif not result.startswith("http"):
+                    result = urljoin(base_url, result)
+                log.info(f"[COOKIE AUDIT PW] Cookie policy found: {result}")
+                return result
         except Exception as e:
             log.warning(f"[COOKIE AUDIT PW] Error finding cookie policy: {e}")
         
