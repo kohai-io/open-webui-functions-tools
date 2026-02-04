@@ -63,8 +63,8 @@ class Pipe:
             description="Time to wait after page load for JS cookies to be set",
         )
         PLAYWRIGHT_WS_URL: str = Field(
-            default="",
-            description="WebSocket URL for remote Playwright browser (e.g., ws://localhost:3000). Leave empty to use local browser.",
+            default="ws://10.100.1.144:3000",
+            description="WebSocket URL for remote Playwright browser (e.g., ws://host:3000). Leave empty to use local browser.",
         )
         HEADLESS: bool = Field(
             default=True,
