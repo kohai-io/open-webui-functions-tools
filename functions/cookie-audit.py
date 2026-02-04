@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.1.2
+version: 1.1.3
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -30,6 +30,9 @@ log.setLevel(logging.DEBUG)
 
 class Pipe:
     """Cookie Compliance Audit Pipeline - ICO/PECR focused"""
+
+    # Class-level cache to prevent duplicate runs
+    _active_audits = {}
 
     class Valves(BaseModel):
         """Configuration options for the cookie audit"""
@@ -192,23 +195,22 @@ class Pipe:
             yield "Please provide a website URL to audit for cookie compliance."
             return
 
-        # Check if an audit report already exists in this conversation
-        # This prevents re-triggering when OWUI calls the pipe for title/follow-up generation
-        for msg in messages:
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "")
-                # Check for our unique report header
-                if "# 🍪 Cookie Compliance Audit" in content and "Overall Compliance:" in content:
-                    log.info("[COOKIE AUDIT] Audit report already exists in conversation, skipping")
-                    return
-
-        last_message = messages[-1].get("content", "")
-        
         # Only process if the last message is from the user
-        if messages[-1].get("role") != "user":
-            log.info("[COOKIE AUDIT] Last message is not from user, skipping")
+        last_message_obj = messages[-1]
+        message_role = last_message_obj.get("role", "unknown")
+        last_message = last_message_obj.get("content", "")
+
+        log.info(f"[COOKIE AUDIT] Received message with role={message_role}, content_preview={last_message[:100]}")
+
+        if message_role != "user":
+            log.info(f"[COOKIE AUDIT] Ignoring non-user message (role={message_role})")
             return
-            
+
+        # Ignore auto-generated suggestion requests from Open WebUI
+        if "### Task:" in last_message or "follow-up questions" in last_message.lower():
+            log.info("[COOKIE AUDIT] Ignoring auto-generated suggestion request")
+            return
+
         target_url = self._extract_url(last_message)
 
         if not target_url:
@@ -224,17 +226,29 @@ class Pipe:
             yield "❌ **Security Error:** Cannot audit internal, private, or localhost URLs.\n"
             return
 
-        yield f"# 🍪 Cookie Compliance Audit\n\n"
-        yield f"**Target:** {target_url}\n"
-        yield f"**Standard:** ICO PECR Guidelines\n"
-        yield f"**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        # Deduplication: Check if this exact audit is already running
+        user_id = __user__.get("id") if __user__ else "unknown"
+        audit_key = f"{user_id}:{target_url}"
 
-        if __event_emitter__:
-            await __event_emitter__(
-                {"type": "status", "data": {"description": "Starting cookie audit...", "done": False}}
-            )
+        if audit_key in Pipe._active_audits:
+            log.warning(f"[COOKIE AUDIT] Duplicate audit request detected for {target_url}, ignoring")
+            return
+
+        # Mark this audit as active
+        Pipe._active_audits[audit_key] = datetime.now()
+        log.info(f"[COOKIE AUDIT] Starting new audit for {target_url} (active_audits: {len(Pipe._active_audits)})")
 
         try:
+            yield f"# 🍪 Cookie Compliance Audit\n\n"
+            yield f"**Target:** {target_url}\n"
+            yield f"**Standard:** ICO PECR Guidelines\n"
+            yield f"**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+            if __event_emitter__:
+                await __event_emitter__(
+                    {"type": "status", "data": {"description": "Starting cookie audit...", "done": False}}
+                )
+
             async with asyncio.timeout(self.valves.TIMEOUT_SECONDS):
                 # Run the audit
                 audit_data = await self.run_audit(target_url, __event_emitter__)
@@ -249,6 +263,10 @@ class Pipe:
             log.exception(f"Cookie audit error: {e}")
             yield f"\n\n❌ **Error during audit:** {str(e)}\n"
         finally:
+            # Clean up: remove from active audits
+            if audit_key in Pipe._active_audits:
+                del Pipe._active_audits[audit_key]
+                log.info(f"[COOKIE AUDIT] Completed audit for {target_url} (active_audits: {len(Pipe._active_audits)})")
             if __event_emitter__:
                 await __event_emitter__(
                     {"type": "status", "data": {"description": "Cookie audit complete", "done": True}}
