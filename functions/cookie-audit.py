@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.0.3
+version: 1.0.4
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -29,9 +29,6 @@ log.setLevel(logging.DEBUG)
 
 class Pipe:
     """Cookie Compliance Audit Pipeline - ICO/PECR focused"""
-
-    # Class-level tracking to prevent duplicate runs
-    _active_audits: Dict[str, float] = {}
 
     class Valves(BaseModel):
         """Configuration options for the cookie audit"""
@@ -162,6 +159,32 @@ class Pipe:
     ) -> AsyncGenerator[str, None]:
         """Main entry point for the cookie audit"""
 
+        # Check if this is a system task request (title generation, follow-ups, tags, etc.)
+        # These tasks should not trigger the audit
+        metadata = body.get("metadata", {})
+        task = metadata.get("task", "")
+        
+        SYSTEM_TASKS = {
+            "title_generation",
+            "follow_up_generation",
+            "tags_generation",
+            "emoji_generation",
+            "query_generation",
+            "autocomplete_generation",
+            "moa_response_generation",
+            "TITLE_GENERATION",
+            "FOLLOW_UP_GENERATION",
+            "TAGS_GENERATION",
+            "EMOJI_GENERATION",
+            "QUERY_GENERATION",
+            "AUTOCOMPLETE_GENERATION",
+            "MOA_RESPONSE_GENERATION",
+        }
+        
+        if task in SYSTEM_TASKS:
+            log.debug(f"[COOKIE AUDIT] Ignoring system task: {task}")
+            return
+
         messages = body.get("messages", [])
         if not messages:
             yield "Please provide a website URL to audit for cookie compliance."
@@ -182,19 +205,6 @@ class Pipe:
         if not self._is_safe_url(target_url):
             yield "❌ **Security Error:** Cannot audit internal, private, or localhost URLs.\n"
             return
-
-        # Deduplication: Prevent multiple concurrent audits of the same URL
-        import time
-        audit_key = target_url
-        current_time = time.time()
-        
-        if audit_key in Pipe._active_audits:
-            last_run = Pipe._active_audits[audit_key]
-            if current_time - last_run < 60:  # Within 60 seconds
-                log.info(f"[COOKIE AUDIT] Skipping duplicate audit for {target_url}")
-                return
-        
-        Pipe._active_audits[audit_key] = current_time
 
         yield f"# 🍪 Cookie Compliance Audit\n\n"
         yield f"**Target:** {target_url}\n"
@@ -221,10 +231,6 @@ class Pipe:
             log.exception(f"Cookie audit error: {e}")
             yield f"\n\n❌ **Error during audit:** {str(e)}\n"
         finally:
-            # Clean up active audit tracking
-            if audit_key in Pipe._active_audits:
-                del Pipe._active_audits[audit_key]
-            
             if __event_emitter__:
                 await __event_emitter__(
                     {"type": "status", "data": {"description": "Cookie audit complete", "done": True}}
