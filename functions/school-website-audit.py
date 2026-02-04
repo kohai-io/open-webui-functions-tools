@@ -1,7 +1,7 @@
 """
 title: Website Compliance Audit Pipeline
 author: Open WebUI
-version: 1.7.4
+version: 1.7.5
 license: MIT
 description: A comprehensive website audit agent with compliance checking, RAG analysis, intelligent sitemap generation, SEO analysis, broken link detection, and change tracking over time
 requirements: aiohttp, beautifulsoup4, lxml, python-dateutil, pydantic, openai, openpyxl
@@ -155,6 +155,10 @@ class Pipe:
             default=True,
             description="Export audit reports as downloadable CSV and Excel files (uploaded to Files section)",
         )
+        GOV_UK_GUIDANCE_URL: str = Field(
+            default="https://www.gov.uk/guidance/what-maintained-schools-must-publish-online",
+            description="GOV.UK guidance URL for school website requirements. Used for fetching framework and report citations.",
+        )
 
     def __init__(self):
         self.type = "pipe"
@@ -177,7 +181,7 @@ class Pipe:
         self._default_checklist = {
             "statutory_information": {
                 "name": "📄 Statutory Information",
-                "gov_uk_url": "https://www.gov.uk/guidance/what-maintained-schools-must-publish-online#statutory-information",
+                "gov_uk_url_anchor": "#statutory-information",
                 "items": [
                     {
                         "id": "ofsted",
@@ -323,7 +327,7 @@ class Pipe:
             },
             "optional_recommended": {
                 "name": "📌 Optional & Recommended",
-                "gov_uk_url": "https://www.gov.uk/guidance/what-maintained-schools-must-publish-online#optional-information",
+                "gov_uk_url_anchor": "#optional-information",
                 "items": [
                     {
                         "id": "ethos",
@@ -586,7 +590,7 @@ class Pipe:
             if filtered_items:
                 filtered[category_id] = {
                     "name": category["name"],
-                    "gov_uk_url": category.get("gov_uk_url"),  # Preserve GOV.UK link
+                    "gov_uk_url": f"{self.valves.GOV_UK_GUIDANCE_URL}{category.get('gov_uk_url_anchor', '')}",
                     "items": filtered_items,
                 }
 
@@ -1102,7 +1106,7 @@ class Pipe:
     async def _fetch_framework_from_govuk(self) -> Optional[Dict[str, Any]]:
         """Fetch and parse UK DfE Schools framework from GOV.UK"""
         try:
-            url = "https://www.gov.uk/guidance/what-maintained-schools-must-publish-online"
+            url = self.valves.GOV_UK_GUIDANCE_URL
             log.info(f"[FRAMEWORK] Fetching from GOV.UK: {url}")
 
             # Fetch page
@@ -1270,7 +1274,7 @@ class Pipe:
         lines.append("")
         lines.append("This framework is based on official GOV.UK guidance:")
         lines.append(
-            "https://www.gov.uk/guidance/what-maintained-schools-must-publish-online"
+            self.valves.GOV_UK_GUIDANCE_URL
         )
         lines.append("")
         lines.append("---")
@@ -3785,7 +3789,7 @@ Type: Webpage
             prompt = f"""You are a compliance auditor for UK maintained schools.
 
 REGULATORY AUTHORITY: UK Department for Education (DfE)
-SOURCE: https://www.gov.uk/guidance/what-maintained-schools-must-publish-online
+SOURCE: {self.valves.GOV_UK_GUIDANCE_URL}
 LEGAL BASIS: School Information (England) Regulations 2008 (as amended), Equality Act 2010, Children and Families Act 2014
 
 SCHOOL TYPE: {school_type_display}
@@ -4352,7 +4356,7 @@ Respond ONLY with valid JSON, no additional text."""
         yield f"# 🔍 Website Compliance Audit\n\n"
         yield f"**Target:** {data['target_url']}\n"
         yield f"**Framework:** {data['framework']}\n"
-        yield f"**Source:** [GOV.UK - What maintained schools must publish online](https://www.gov.uk/guidance/what-maintained-schools-must-publish-online)\n"
+        yield f"**Source:** [GOV.UK - What maintained schools must publish online]({self.valves.GOV_UK_GUIDANCE_URL})\n"
 
         # Show school type if detected
         school_type = data.get("school_type", "unknown")
