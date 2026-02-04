@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.0.5
+version: 1.0.6
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -116,6 +116,12 @@ class Pipe:
                     re.compile(r"^(session|csrf|xsrf|token|auth|login|cart|basket|checkout|security).*$", re.IGNORECASE),
                     re.compile(r"^(consent|cookie_consent|cookieconsent|cc_cookie|gdpr|accepted_cookies|cookie_notice|cookies_accepted).*$", re.IGNORECASE),
                     re.compile(r"^(phpsessid|jsessionid|asp\.net_sessionid|laravel_session|wordpress_logged_in|wp-settings).*$", re.IGNORECASE),
+                    # Infrastructure/CDN cookies (load balancing, security, bot protection)
+                    re.compile(r"^(AWSALB|AWSALBCORS|AWSELB|AWSELBCORS).*$", re.IGNORECASE),  # AWS load balancer
+                    re.compile(r"^(__cf_bm|_cfuvid|cf_clearance|__cfruid|__cflb).*$", re.IGNORECASE),  # Cloudflare
+                    re.compile(r"^(JSESSIONID|SERVERID|ROUTEID|BACKEND).*$", re.IGNORECASE),  # Generic load balancer
+                    re.compile(r"^(incap_ses|visid_incap|nlbi_).*$", re.IGNORECASE),  # Incapsula/Imperva
+                    re.compile(r"^(ak_bmsc|bm_sv|bm_sz).*$", re.IGNORECASE),  # Akamai
                 ],
                 "description": "Strictly necessary for website functionality",
                 "requires_consent": False,
