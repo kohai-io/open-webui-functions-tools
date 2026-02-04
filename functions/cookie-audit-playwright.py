@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit (Playwright)
 author: Open WebUI
-version: 1.0.0
+version: 1.0.2
 license: MIT
 description: Advanced cookie compliance audit using Playwright for real browser rendering. Captures HTTP and JavaScript cookies, detects trackers using EasyPrivacy lists, analyzes third-party requests, and generates ICO PECR compliance reports. Based on EDPB Website Auditing Tool (EUPL-1.2).
 requirements: playwright, aiohttp, pydantic, adblockparser
@@ -450,12 +450,29 @@ class Pipe:
                 
                 page.on("request", handle_request)
                 
-                # Navigate to page
+                # Navigate to page with retry on failure
                 log.info(f"[COOKIE AUDIT PW] Navigating to {url}")
-                response = page.goto(url, wait_until="networkidle", timeout=self.valves.PAGE_TIMEOUT_MS)
+                response = None
+                navigation_error = None
                 
-                if response:
-                    log.info(f"[COOKIE AUDIT PW] Page loaded with status {response.status}")
+                # Try networkidle first, fallback to load on failure
+                for wait_strategy in ["networkidle", "load", "domcontentloaded"]:
+                    try:
+                        response = page.goto(url, wait_until=wait_strategy, timeout=self.valves.PAGE_TIMEOUT_MS)
+                        if response:
+                            log.info(f"[COOKIE AUDIT PW] Page loaded with status {response.status} (wait_until={wait_strategy})")
+                            navigation_error = None
+                            break
+                    except Exception as e:
+                        navigation_error = str(e)
+                        log.warning(f"[COOKIE AUDIT PW] Navigation failed with {wait_strategy}: {e}")
+                        if "net::ERR_" in str(e) or "timeout" in str(e).lower():
+                            continue  # Try next strategy
+                        else:
+                            raise  # Re-raise non-network errors
+                
+                if navigation_error and not response:
+                    raise Exception(f"Failed to load page after retries: {navigation_error}")
                 
                 # Wait for JS cookies to be set
                 page.wait_for_timeout(self.valves.WAIT_AFTER_LOAD_MS)
