@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.0.6
+version: 1.1.0
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -22,6 +22,7 @@ import socket
 import aiohttp
 from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
+from openai import AsyncOpenAI
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
@@ -46,12 +47,33 @@ class Pipe:
             description="Seconds between requests to avoid overloading the server",
         )
         TIMEOUT_SECONDS: int = Field(
-            default=120,
+            default=180,
             description="Maximum time for the entire audit",
         )
         ICO_GUIDANCE_URL: str = Field(
             default="https://ico.org.uk/for-organisations/direct-marketing-and-privacy-and-electronic-communications/guide-to-pecr/cookies-and-similar-technologies/",
             description="ICO guidance URL for cookie compliance citations",
+        )
+        # LLM Analysis Configuration
+        ENABLE_LLM_ANALYSIS: bool = Field(
+            default=False,
+            description="Use LLM to analyze cookie policy quality and classify unknown cookies. Provides deeper insights but increases audit time.",
+        )
+        LLM_MODEL: str = Field(
+            default="gpt-4o-mini",
+            description="LLM model for analysis. Examples: gpt-4o-mini, gpt-4o, llama3.1, gemini-2.0-flash",
+        )
+        OPENAI_API_KEY: str = Field(
+            default="",
+            description="OpenAI API key (or compatible API). Required if ENABLE_LLM_ANALYSIS is True.",
+        )
+        OPENAI_BASE_URL: str = Field(
+            default="https://api.openai.com/v1",
+            description="OpenAI API base URL. Use for compatible APIs (e.g., http://localhost:11434/v1 for Ollama)",
+        )
+        LLM_TIMEOUT_SECONDS: int = Field(
+            default=60,
+            description="Timeout for LLM API calls",
         )
         DEBUG_MODE: bool = Field(
             default=False,
@@ -339,7 +361,35 @@ class Pipe:
         # Phase 4: Check cookie policy
         policy_analysis = self.analyze_cookie_policy(pages)
 
-        # Phase 5: Assess ICO compliance
+        # Phase 5: LLM Analysis (optional)
+        llm_policy_analysis = None
+        llm_cookie_classification = None
+        
+        if self.valves.ENABLE_LLM_ANALYSIS and self.valves.OPENAI_API_KEY:
+            # Get policy page content for LLM analysis
+            if policy_analysis["policy_found"]:
+                policy_page = None
+                for page in pages:
+                    if page.get("url") == policy_analysis["policy_url"]:
+                        policy_page = page
+                        break
+                
+                if policy_page:
+                    llm_policy_analysis = await self.llm_analyze_policy(
+                        policy_page.get("content", ""),
+                        policy_analysis["policy_url"],
+                        event_emitter
+                    )
+            
+            # Classify unknown cookies
+            unknown_cookies = cookie_analysis["by_category"].get("unknown", [])
+            if unknown_cookies:
+                llm_cookie_classification = await self.llm_classify_cookies(
+                    unknown_cookies,
+                    event_emitter
+                )
+
+        # Phase 6: Assess ICO compliance
         if event_emitter:
             await event_emitter(
                 {"type": "status", "data": {"description": "Assessing ICO compliance...", "done": False}}
@@ -360,6 +410,8 @@ class Pipe:
             "consent_analysis": consent_analysis,
             "policy_analysis": policy_analysis,
             "compliance_results": compliance_results,
+            "llm_policy_analysis": llm_policy_analysis,
+            "llm_cookie_classification": llm_cookie_classification,
         }
 
     async def crawl_and_collect_cookies(self, url: str) -> Dict[str, Any]:
@@ -892,6 +944,167 @@ class Pipe:
             "overall_status": overall_status,
         }
 
+    async def llm_analyze_policy(
+        self,
+        policy_content: str,
+        policy_url: str,
+        event_emitter: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
+        """Use LLM to analyze cookie policy quality and clarity"""
+        
+        if not self.valves.ENABLE_LLM_ANALYSIS or not self.valves.OPENAI_API_KEY:
+            return {"analyzed": False, "reason": "LLM analysis disabled or no API key"}
+
+        if event_emitter:
+            await event_emitter({
+                "type": "status",
+                "data": {"description": "🤖 Analyzing cookie policy with LLM...", "done": False}
+            })
+
+        prompt = f"""Analyze this cookie policy page for ICO PECR compliance. Assess the following:
+
+1. **Clarity**: Is the policy written in plain, accessible language? (Score 1-5)
+2. **Completeness**: Does it cover all required information? (Score 1-5)
+3. **Cookie List**: Are specific cookies clearly listed with purposes? (Score 1-5)
+4. **Third Parties**: Are third-party cookies clearly identified? (Score 1-5)
+5. **User Control**: Does it explain how users can manage/delete cookies? (Score 1-5)
+
+COOKIE POLICY URL: {policy_url}
+
+COOKIE POLICY CONTENT:
+{policy_content[:8000]}
+
+Respond with JSON only:
+{{
+    "clarity_score": <1-5>,
+    "clarity_notes": "<brief assessment>",
+    "completeness_score": <1-5>,
+    "completeness_notes": "<brief assessment>",
+    "cookie_list_score": <1-5>,
+    "cookie_list_notes": "<brief assessment>",
+    "third_party_score": <1-5>,
+    "third_party_notes": "<brief assessment>",
+    "user_control_score": <1-5>,
+    "user_control_notes": "<brief assessment>",
+    "overall_score": <1-5>,
+    "summary": "<2-3 sentence summary>",
+    "recommendations": ["<recommendation 1>", "<recommendation 2>"]
+}}"""
+
+        try:
+            client = AsyncOpenAI(
+                api_key=self.valves.OPENAI_API_KEY,
+                base_url=self.valves.OPENAI_BASE_URL,
+                timeout=self.valves.LLM_TIMEOUT_SECONDS,
+            )
+
+            log.info(f"[LLM] Analyzing cookie policy with {self.valves.LLM_MODEL}")
+            response = await client.chat.completions.create(
+                model=self.valves.LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+            )
+
+            llm_text = response.choices[0].message.content
+            log.debug(f"[LLM] Policy analysis response: {llm_text[:200]}...")
+
+            # Parse JSON from response
+            json_start = llm_text.find("{")
+            json_end = llm_text.rfind("}") + 1
+            if json_start >= 0 and json_end > json_start:
+                result = json.loads(llm_text[json_start:json_end])
+                result["analyzed"] = True
+                return result
+
+            return {"analyzed": False, "error": "Could not parse LLM response"}
+
+        except Exception as e:
+            log.error(f"[LLM] Policy analysis error: {e}")
+            return {"analyzed": False, "error": str(e)}
+
+    async def llm_classify_cookies(
+        self,
+        unknown_cookies: List[Dict],
+        event_emitter: Optional[Callable[[dict], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
+        """Use LLM to classify unknown cookies"""
+        
+        if not self.valves.ENABLE_LLM_ANALYSIS or not self.valves.OPENAI_API_KEY:
+            return {"classified": False, "reason": "LLM analysis disabled or no API key"}
+
+        if not unknown_cookies:
+            return {"classified": True, "classifications": []}
+
+        if event_emitter:
+            await event_emitter({
+                "type": "status",
+                "data": {"description": f"🤖 Classifying {len(unknown_cookies)} unknown cookies...", "done": False}
+            })
+
+        cookie_list = "\n".join([
+            f"- {c['name']} (domain: {c.get('domain', 'unknown')}, secure: {c.get('secure', False)}, httponly: {c.get('httponly', False)})"
+            for c in unknown_cookies[:20]  # Limit to 20 cookies
+        ])
+
+        prompt = f"""Classify these cookies into ICO PECR categories. For each cookie, determine:
+- Category: essential, analytics, marketing, functional, or unknown
+- Requires consent: true/false
+- Likely purpose: brief description
+
+COOKIES TO CLASSIFY:
+{cookie_list}
+
+Known cookie patterns:
+- AWSALB, AWSALBCORS = AWS load balancer (essential)
+- __cf_bm, _cfuvid = Cloudflare bot protection (essential)
+- _ga, _gid = Google Analytics (analytics)
+- _fbp, fr = Facebook (marketing)
+- lang, locale = Language preference (functional)
+
+Respond with JSON only:
+{{
+    "classifications": [
+        {{
+            "name": "<cookie name>",
+            "category": "<essential|analytics|marketing|functional|unknown>",
+            "requires_consent": <true|false>,
+            "purpose": "<brief description>",
+            "confidence": "<high|medium|low>"
+        }}
+    ]
+}}"""
+
+        try:
+            client = AsyncOpenAI(
+                api_key=self.valves.OPENAI_API_KEY,
+                base_url=self.valves.OPENAI_BASE_URL,
+                timeout=self.valves.LLM_TIMEOUT_SECONDS,
+            )
+
+            log.info(f"[LLM] Classifying {len(unknown_cookies)} cookies with {self.valves.LLM_MODEL}")
+            response = await client.chat.completions.create(
+                model=self.valves.LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=1000,
+            )
+
+            llm_text = response.choices[0].message.content
+            log.debug(f"[LLM] Cookie classification response: {llm_text[:200]}...")
+
+            # Parse JSON from response
+            json_start = llm_text.find("{")
+            json_end = llm_text.rfind("}") + 1
+            if json_start >= 0 and json_end > json_start:
+                result = json.loads(llm_text[json_start:json_end])
+                result["classified"] = True
+                return result
+
+            return {"classified": False, "error": "Could not parse LLM response"}
+
+        except Exception as e:
+            log.error(f"[LLM] Cookie classification error: {e}")
+            return {"classified": False, "error": str(e)}
+
     async def generate_report(self, data: Dict[str, Any]) -> AsyncGenerator[str, None]:
         """Generate the compliance report"""
 
@@ -987,6 +1200,45 @@ class Pipe:
             yield f"**Issues:**\n"
             for issue in policy["issues"]:
                 yield f"- ⚠️ {issue}\n"
+            yield f"\n"
+
+        # LLM Policy Analysis (if available)
+        llm_policy = data.get("llm_policy_analysis")
+        if llm_policy and llm_policy.get("analyzed"):
+            yield f"### 🤖 AI Policy Analysis\n\n"
+            
+            yield f"| Aspect | Score | Notes |\n"
+            yield f"|--------|-------|-------|\n"
+            yield f"| Clarity | {'⭐' * llm_policy.get('clarity_score', 0)}/5 | {llm_policy.get('clarity_notes', '')[:50]} |\n"
+            yield f"| Completeness | {'⭐' * llm_policy.get('completeness_score', 0)}/5 | {llm_policy.get('completeness_notes', '')[:50]} |\n"
+            yield f"| Cookie List | {'⭐' * llm_policy.get('cookie_list_score', 0)}/5 | {llm_policy.get('cookie_list_notes', '')[:50]} |\n"
+            yield f"| Third Parties | {'⭐' * llm_policy.get('third_party_score', 0)}/5 | {llm_policy.get('third_party_notes', '')[:50]} |\n"
+            yield f"| User Control | {'⭐' * llm_policy.get('user_control_score', 0)}/5 | {llm_policy.get('user_control_notes', '')[:50]} |\n\n"
+            
+            if llm_policy.get("summary"):
+                yield f"**Summary:** {llm_policy['summary']}\n\n"
+            
+            if llm_policy.get("recommendations"):
+                yield f"**AI Recommendations:**\n"
+                for rec in llm_policy["recommendations"][:3]:
+                    yield f"- 🤖 {rec}\n"
+                yield f"\n"
+
+        # LLM Cookie Classification (if available)
+        llm_cookies = data.get("llm_cookie_classification")
+        if llm_cookies and llm_cookies.get("classified") and llm_cookies.get("classifications"):
+            yield f"### 🤖 AI Cookie Classification\n\n"
+            yield f"| Cookie | Category | Purpose | Confidence |\n"
+            yield f"|--------|----------|---------|------------|\n"
+            
+            for c in llm_cookies["classifications"][:10]:
+                name = c.get("name", "")[:20]
+                cat = c.get("category", "unknown")
+                purpose = c.get("purpose", "")[:30]
+                conf = c.get("confidence", "low")
+                conf_emoji = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(conf, "⚪")
+                yield f"| {name} | {cat} | {purpose} | {conf_emoji} {conf} |\n"
+            
             yield f"\n"
 
         # Cookie Details (collapsible)
