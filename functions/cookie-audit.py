@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.1.0
+version: 1.1.2
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -187,38 +187,28 @@ class Pipe:
     ) -> AsyncGenerator[str, None]:
         """Main entry point for the cookie audit"""
 
-        # Check if this is a system task request (title generation, follow-ups, tags, etc.)
-        # These tasks should not trigger the audit
-        metadata = body.get("metadata", {})
-        task = metadata.get("task", "")
-        
-        SYSTEM_TASKS = {
-            "title_generation",
-            "follow_up_generation",
-            "tags_generation",
-            "emoji_generation",
-            "query_generation",
-            "autocomplete_generation",
-            "moa_response_generation",
-            "TITLE_GENERATION",
-            "FOLLOW_UP_GENERATION",
-            "TAGS_GENERATION",
-            "EMOJI_GENERATION",
-            "QUERY_GENERATION",
-            "AUTOCOMPLETE_GENERATION",
-            "MOA_RESPONSE_GENERATION",
-        }
-        
-        if task in SYSTEM_TASKS:
-            log.debug(f"[COOKIE AUDIT] Ignoring system task: {task}")
-            return
-
         messages = body.get("messages", [])
         if not messages:
             yield "Please provide a website URL to audit for cookie compliance."
             return
 
+        # Check if an audit report already exists in this conversation
+        # This prevents re-triggering when OWUI calls the pipe for title/follow-up generation
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                # Check for our unique report header
+                if "# 🍪 Cookie Compliance Audit" in content and "Overall Compliance:" in content:
+                    log.info("[COOKIE AUDIT] Audit report already exists in conversation, skipping")
+                    return
+
         last_message = messages[-1].get("content", "")
+        
+        # Only process if the last message is from the user
+        if messages[-1].get("role") != "user":
+            log.info("[COOKIE AUDIT] Last message is not from user, skipping")
+            return
+            
         target_url = self._extract_url(last_message)
 
         if not target_url:
