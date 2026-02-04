@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.0.2
+version: 1.0.3
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -29,6 +29,9 @@ log.setLevel(logging.DEBUG)
 
 class Pipe:
     """Cookie Compliance Audit Pipeline - ICO/PECR focused"""
+
+    # Class-level tracking to prevent duplicate runs
+    _active_audits: Dict[str, float] = {}
 
     class Valves(BaseModel):
         """Configuration options for the cookie audit"""
@@ -180,6 +183,19 @@ class Pipe:
             yield "❌ **Security Error:** Cannot audit internal, private, or localhost URLs.\n"
             return
 
+        # Deduplication: Prevent multiple concurrent audits of the same URL
+        import time
+        audit_key = target_url
+        current_time = time.time()
+        
+        if audit_key in Pipe._active_audits:
+            last_run = Pipe._active_audits[audit_key]
+            if current_time - last_run < 60:  # Within 60 seconds
+                log.info(f"[COOKIE AUDIT] Skipping duplicate audit for {target_url}")
+                return
+        
+        Pipe._active_audits[audit_key] = current_time
+
         yield f"# 🍪 Cookie Compliance Audit\n\n"
         yield f"**Target:** {target_url}\n"
         yield f"**Standard:** ICO PECR Guidelines\n"
@@ -205,6 +221,10 @@ class Pipe:
             log.exception(f"Cookie audit error: {e}")
             yield f"\n\n❌ **Error during audit:** {str(e)}\n"
         finally:
+            # Clean up active audit tracking
+            if audit_key in Pipe._active_audits:
+                del Pipe._active_audits[audit_key]
+            
             if __event_emitter__:
                 await __event_emitter__(
                     {"type": "status", "data": {"description": "Cookie audit complete", "done": True}}
@@ -603,8 +623,14 @@ class Pipe:
         }
 
         # Find cookie policy page
-        policy_keywords = ["cookie policy", "cookie notice", "cookies policy", "use of cookies"]
-        policy_url_patterns = ["cookie", "cookies"]
+        policy_keywords = ["cookie policy", "cookie notice", "cookies policy", "use of cookies", "cookie-notice", "cookie-policy"]
+        policy_url_patterns = [
+            r"cookie[-_]?policy",
+            r"cookie[-_]?notice", 
+            r"cookies[-_]?policy",
+            r"privacy.*cookie",
+            r"cookie.*privacy",
+        ]
 
         for page in pages:
             url_lower = page.get("url", "").lower()
@@ -618,10 +644,17 @@ class Pipe:
                     is_policy_page = True
                     break
 
-            for pattern in policy_url_patterns:
-                if pattern in url_lower and ("policy" in url_lower or "notice" in url_lower):
+            # Check URL patterns with regex for more flexibility
+            if not is_policy_page:
+                for pattern in policy_url_patterns:
+                    if re.search(pattern, url_lower):
+                        is_policy_page = True
+                        break
+
+            # Also check if URL contains both "cookie" and ("policy" or "notice") anywhere
+            if not is_policy_page:
+                if "cookie" in url_lower and ("policy" in url_lower or "notice" in url_lower):
                     is_policy_page = True
-                    break
 
             if is_policy_page:
                 policy_analysis["policy_found"] = True
