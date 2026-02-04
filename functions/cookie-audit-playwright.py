@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit (Playwright)
 author: Open WebUI
-version: 1.0.2
+version: 1.0.3
 license: MIT
 description: Advanced cookie compliance audit using Playwright for real browser rendering. Captures HTTP and JavaScript cookies, detects trackers using EasyPrivacy lists, analyzes third-party requests, and generates ICO PECR compliance reports. Based on EDPB Website Auditing Tool (EUPL-1.2).
 requirements: playwright, aiohttp, pydantic, adblockparser
@@ -421,16 +421,78 @@ class Pipe:
                 # Create temp file for HAR
                 har_path = tempfile.mktemp(suffix=".har")
                 
-                # Create context with HAR recording (like EDPB WAT)
+                # Create context with HAR recording and anti-detection settings
                 context = browser.new_context(
                     user_agent=self.valves.USER_AGENT,
                     record_har_path=har_path,
                     record_har_content="omit",  # Don't record response bodies
                     ignore_https_errors=True,
+                    # Anti-detection: Set realistic viewport
+                    viewport={"width": 1920, "height": 1080},
+                    # Anti-detection: Set locale and timezone
+                    locale="en-GB",
+                    timezone_id="Europe/London",
+                    # Anti-detection: Enable JavaScript
+                    java_script_enabled=True,
+                    # Anti-detection: Set color scheme
+                    color_scheme="light",
                 )
                 
                 # Track requests for tracker detection
                 page = context.new_page()
+                
+                # Anti-detection: Override navigator properties to hide headless indicators
+                page.add_init_script("""
+                    // Override webdriver property
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    
+                    // Override plugins to look like a real browser
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [
+                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
+                            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
+                            { name: 'Native Client', filename: 'internal-nacl-plugin' }
+                        ]
+                    });
+                    
+                    // Override languages
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['en-GB', 'en-US', 'en']
+                    });
+                    
+                    // Override platform
+                    Object.defineProperty(navigator, 'platform', {
+                        get: () => 'Win32'
+                    });
+                    
+                    // Override hardware concurrency
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {
+                        get: () => 8
+                    });
+                    
+                    // Override device memory
+                    Object.defineProperty(navigator, 'deviceMemory', {
+                        get: () => 8
+                    });
+                    
+                    // Override permissions query
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters.name === 'notifications' ?
+                            Promise.resolve({ state: Notification.permission }) :
+                            originalQuery(parameters)
+                    );
+                    
+                    // Override chrome runtime
+                    window.chrome = {
+                        runtime: {},
+                        loadTimes: function() {},
+                        csi: function() {},
+                        app: {}
+                    };
+                """)
                 
                 # Set up request interception for tracker detection
                 main_domain = urlparse(url).netloc
