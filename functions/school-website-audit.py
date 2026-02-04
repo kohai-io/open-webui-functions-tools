@@ -1,9 +1,9 @@
 """
 title: Website Compliance Audit Pipeline
 author: Open WebUI
-version: 1.7.5
+version: 1.8.0
 license: MIT
-description: A comprehensive website audit agent with compliance checking, RAG analysis, intelligent sitemap generation, SEO analysis, broken link detection, and change tracking over time
+description: A comprehensive website audit agent with compliance checking, RAG analysis, intelligent sitemap generation, SEO analysis, broken link detection, cookie compliance auditing (GDPR/PECR), and change tracking over time
 requirements: aiohttp, beautifulsoup4, lxml, python-dateutil, pydantic, openai, openpyxl
 """
 
@@ -158,6 +158,14 @@ class Pipe:
         GOV_UK_GUIDANCE_URL: str = Field(
             default="https://www.gov.uk/guidance/what-maintained-schools-must-publish-online",
             description="GOV.UK guidance URL for school website requirements. Used for fetching framework and report citations.",
+        )
+        ENABLE_COOKIE_AUDIT: bool = Field(
+            default=True,
+            description="Audit cookie usage and consent mechanisms (GDPR/PECR compliance)",
+        )
+        ICO_COOKIE_GUIDANCE_URL: str = Field(
+            default="https://ico.org.uk/for-organisations/direct-marketing-and-privacy-and-electronic-communications/guide-to-pecr/cookies-and-similar-technologies/",
+            description="ICO guidance URL for cookie compliance. Used for report citations.",
         )
 
     def __init__(self):
@@ -736,10 +744,13 @@ class Pipe:
         page_cache = self.load_page_cache(cache_key)
         stats = {"cached": 0, "fetched": 0, "unchanged": 0}
         page_relationships = {}  # Track parent-child relationships for sitemap
+        collected_cookies = {}  # Track cookies: {cookie_name: cookie_info}
 
         domain = urlparse(url).netloc
 
-        async with aiohttp.ClientSession() as session:
+        # Create cookie jar to collect cookies
+        cookie_jar = aiohttp.CookieJar()
+        async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
             while to_visit and len(visited) < self.valves.MAX_PAGES:
                 current_url, depth, parent_url = to_visit.pop(0)
 
@@ -890,11 +901,28 @@ class Pipe:
                         stats["cached"] += 1
                     continue
 
+                # Collect cookies from cookie jar
+                if self.valves.ENABLE_COOKIE_AUDIT:
+                    for cookie in cookie_jar:
+                        if cookie.key not in collected_cookies:
+                            collected_cookies[cookie.key] = {
+                                "name": cookie.key,
+                                "value": cookie.value[:50] + "..." if len(cookie.value) > 50 else cookie.value,
+                                "domain": cookie.get("domain", domain),
+                                "path": cookie.get("path", "/"),
+                                "secure": cookie.get("secure", False),
+                                "httponly": cookie.get("httponly", False),
+                                "expires": str(cookie.get("expires", "")),
+                                "samesite": cookie.get("samesite", ""),
+                                "first_seen_url": current_url,
+                            }
+
                 # Yield progress
                 yield {
                     "pages": pages,
                     "stats": stats,
                     "relationships": page_relationships,
+                    "cookies": collected_cookies,
                 }
 
             # Save page cache
@@ -1102,6 +1130,184 @@ class Pipe:
                     pass
 
         return dates
+
+    def analyze_cookies(self, cookies: Dict[str, Dict], pages: List[Dict]) -> Dict[str, Any]:
+        """
+        Analyze collected cookies for GDPR/PECR compliance.
+        Returns cookie audit results with classifications and compliance status.
+        """
+        if not cookies:
+            return {
+                "total_cookies": 0,
+                "status": "GREEN",
+                "reason": "No cookies detected",
+                "cookies_by_category": {},
+                "consent_mechanism": None,
+                "cookie_policy_found": False,
+                "issues": [],
+                "recommendations": [],
+            }
+
+        # Known cookie patterns for classification
+        cookie_patterns = {
+            "essential": {
+                "patterns": [
+                    r"^(session|csrf|xsrf|token|auth|login|cart|basket|checkout|security|consent|cookie_consent|cookieconsent|cc_cookie|gdpr|accepted_cookies|cookie_notice|cookies_accepted)$",
+                    r"^(phpsessid|jsessionid|asp\.net_sessionid|laravel_session|wordpress_logged_in|wp-settings).*$",
+                ],
+                "description": "Strictly necessary for website functionality",
+                "requires_consent": False,
+            },
+            "analytics": {
+                "patterns": [
+                    r"^(_ga|_gid|_gat|_gtag|__utm|_hjid|_hjSession|_pk_id|_pk_ses|amplitude|mixpanel|segment|heap|hotjar|clarity).*$",
+                    r"^(google.analytics|analytics|tracking|visitor|pageview).*$",
+                ],
+                "description": "Used to understand how visitors use the website",
+                "requires_consent": True,
+            },
+            "marketing": {
+                "patterns": [
+                    r"^(_fbp|_fbc|fr|tr|_gcl|gclid|_uetsid|_uetvid|IDE|DSID|__gads|__gpi|_rdt_uuid|_pin_unauth).*$",
+                    r"^(facebook|fb_|google_ads|doubleclick|adsense|adwords|remarketing|retargeting).*$",
+                ],
+                "description": "Used for advertising and remarketing",
+                "requires_consent": True,
+            },
+            "functional": {
+                "patterns": [
+                    r"^(lang|language|locale|timezone|theme|dark_mode|font_size|accessibility|preferences|settings).*$",
+                ],
+                "description": "Remember user preferences",
+                "requires_consent": True,
+            },
+        }
+
+        # Classify cookies
+        cookies_by_category = {
+            "essential": [],
+            "analytics": [],
+            "marketing": [],
+            "functional": [],
+            "unknown": [],
+        }
+
+        for cookie_name, cookie_info in cookies.items():
+            classified = False
+            cookie_name_lower = cookie_name.lower()
+
+            for category, config in cookie_patterns.items():
+                for pattern in config["patterns"]:
+                    if re.match(pattern, cookie_name_lower, re.IGNORECASE):
+                        cookies_by_category[category].append({
+                            **cookie_info,
+                            "category": category,
+                            "requires_consent": config["requires_consent"],
+                        })
+                        classified = True
+                        break
+                if classified:
+                    break
+
+            if not classified:
+                cookies_by_category["unknown"].append({
+                    **cookie_info,
+                    "category": "unknown",
+                    "requires_consent": True,  # Assume consent required for unknown
+                })
+
+        # Check for cookie consent mechanism
+        consent_keywords = [
+            "cookie consent", "cookie banner", "cookie notice", "cookie policy",
+            "accept cookies", "cookie preferences", "manage cookies", "cookie settings",
+            "we use cookies", "this site uses cookies", "gdpr", "privacy preferences"
+        ]
+
+        consent_mechanism_found = False
+        cookie_policy_found = False
+        cookie_policy_url = None
+
+        for page in pages:
+            content_lower = page.get("content", "").lower()
+            title_lower = page.get("title", "").lower()
+            url_lower = page.get("url", "").lower()
+
+            # Check for consent mechanism in page content
+            if any(kw in content_lower for kw in consent_keywords):
+                consent_mechanism_found = True
+
+            # Check for cookie policy page
+            if "cookie" in url_lower and ("policy" in url_lower or "notice" in url_lower):
+                cookie_policy_found = True
+                cookie_policy_url = page.get("url")
+            elif "cookie policy" in title_lower or "cookie notice" in title_lower:
+                cookie_policy_found = True
+                cookie_policy_url = page.get("url")
+
+        # Determine compliance status and issues
+        issues = []
+        recommendations = []
+
+        non_essential_count = (
+            len(cookies_by_category["analytics"]) +
+            len(cookies_by_category["marketing"]) +
+            len(cookies_by_category["functional"]) +
+            len(cookies_by_category["unknown"])
+        )
+
+        # Check for issues
+        if non_essential_count > 0 and not consent_mechanism_found:
+            issues.append("Non-essential cookies set without visible consent mechanism")
+
+        if non_essential_count > 0 and not cookie_policy_found:
+            issues.append("No cookie policy page found")
+
+        if len(cookies_by_category["unknown"]) > 0:
+            issues.append(f"{len(cookies_by_category['unknown'])} unclassified cookies detected")
+
+        if len(cookies_by_category["marketing"]) > 0:
+            issues.append(f"Marketing/tracking cookies detected ({len(cookies_by_category['marketing'])})")
+
+        # Generate recommendations
+        if not cookie_policy_found:
+            recommendations.append("Create a dedicated cookie policy page explaining what cookies are used and why")
+
+        if not consent_mechanism_found and non_essential_count > 0:
+            recommendations.append("Implement a cookie consent banner that allows users to accept/reject non-essential cookies")
+
+        if len(cookies_by_category["unknown"]) > 0:
+            recommendations.append("Review and document all cookies, ensuring each has a clear purpose")
+
+        if len(cookies_by_category["marketing"]) > 0:
+            recommendations.append("Ensure marketing cookies are only set after explicit user consent")
+
+        # Determine overall status
+        if len(issues) == 0:
+            status = "GREEN"
+            reason = "Cookie usage appears compliant"
+        elif len(issues) <= 2 and "Marketing" not in str(issues):
+            status = "AMBER"
+            reason = "Minor cookie compliance issues detected"
+        else:
+            status = "RED"
+            reason = "Significant cookie compliance issues detected"
+
+        return {
+            "total_cookies": len(cookies),
+            "status": status,
+            "reason": reason,
+            "cookies_by_category": cookies_by_category,
+            "consent_mechanism_found": consent_mechanism_found,
+            "cookie_policy_found": cookie_policy_found,
+            "cookie_policy_url": cookie_policy_url,
+            "issues": issues,
+            "recommendations": recommendations,
+            "essential_count": len(cookies_by_category["essential"]),
+            "analytics_count": len(cookies_by_category["analytics"]),
+            "marketing_count": len(cookies_by_category["marketing"]),
+            "functional_count": len(cookies_by_category["functional"]),
+            "unknown_count": len(cookies_by_category["unknown"]),
+        }
 
     async def _fetch_framework_from_govuk(self) -> Optional[Dict[str, Any]]:
         """Fetch and parse UK DfE Schools framework from GOV.UK"""
@@ -4091,15 +4297,17 @@ Respond ONLY with valid JSON, no additional text."""
                 "unchanged": 0,
                 "used_cache": False,
             }
+            collected_cookies = {}
             async for update in self.crawl_website(target_url, cache_key):
                 pages = update.get("pages", [])
                 crawl_stats = update.get("stats", crawl_stats)
+                collected_cookies = update.get("cookies", {})
                 if self.valves.DEBUG_MODE and len(pages) % 20 == 0:
                     log.info(
                         f"[CRAWL] Progress: {len(pages)} pages, Stats: {crawl_stats}"
                     )
 
-            log.info(f"[CRAWL] Complete: {len(pages)} pages discovered")
+            log.info(f"[CRAWL] Complete: {len(pages)} pages discovered, {len(collected_cookies)} cookies collected")
             log.info(f"[CRAWL] Final stats: {crawl_stats}")
 
             if self.valves.ENABLE_CACHE:
@@ -4318,6 +4526,13 @@ Respond ONLY with valid JSON, no additional text."""
                 f"[SITEMAP] Generated mermaid diagram ({len(sitemap_mermaid)} chars)"
             )
 
+        # Analyze cookies if enabled and collected
+        cookie_audit = None
+        if self.valves.ENABLE_COOKIE_AUDIT:
+            cookies_to_analyze = collected_cookies if 'collected_cookies' in locals() else {}
+            cookie_audit = self.analyze_cookies(cookies_to_analyze, pages)
+            log.info(f"[COOKIES] Audit complete: {cookie_audit.get('total_cookies', 0)} cookies, status: {cookie_audit.get('status', 'N/A')}")
+
         return {
             "target_url": target_url,
             "framework": self.valves.REGULATORY_FRAMEWORK,
@@ -4342,6 +4557,7 @@ Respond ONLY with valid JSON, no additional text."""
                 "red_pct": (red_count / total_items * 100) if total_items else 0,
             },
             "checklist": self.compliance_checklist,
+            "cookie_audit": cookie_audit,
         }
 
     async def format_markdown_report(
@@ -4536,6 +4752,85 @@ Respond ONLY with valid JSON, no additional text."""
                 yield f"```\n\n"
                 yield f"*Full sitemap available in Knowledge Base for semantic search*\n"
                 yield f"</details>\n\n"
+
+        # Cookie Audit Section
+        cookie_audit = data.get("cookie_audit")
+        if cookie_audit and cookie_audit.get("total_cookies", 0) > 0:
+            yield f"---\n\n"
+            yield f"## 🍪 Cookie Compliance Audit\n\n"
+            yield f"📖 [ICO Cookie Guidance]({self.valves.ICO_COOKIE_GUIDANCE_URL})\n\n"
+
+            status_emoji = {"GREEN": "🟢", "AMBER": "🟡", "RED": "🔴"}.get(cookie_audit.get("status"), "⚪")
+            yield f"**Status:** {status_emoji} {cookie_audit.get('reason', 'Unknown')}\n\n"
+
+            yield f"### Cookie Summary\n\n"
+            yield f"| Category | Count | Requires Consent |\n"
+            yield f"|----------|-------|------------------|\n"
+            yield f"| Essential | {cookie_audit.get('essential_count', 0)} | No |\n"
+            yield f"| Analytics | {cookie_audit.get('analytics_count', 0)} | Yes |\n"
+            yield f"| Marketing | {cookie_audit.get('marketing_count', 0)} | Yes |\n"
+            yield f"| Functional | {cookie_audit.get('functional_count', 0)} | Yes |\n"
+            yield f"| Unknown | {cookie_audit.get('unknown_count', 0)} | Assumed Yes |\n"
+            yield f"| **Total** | **{cookie_audit.get('total_cookies', 0)}** | |\n\n"
+
+            # Consent mechanism status
+            if cookie_audit.get("consent_mechanism_found"):
+                yield f"✅ **Cookie consent mechanism detected**\n"
+            else:
+                yield f"⚠️ **No cookie consent mechanism detected**\n"
+
+            if cookie_audit.get("cookie_policy_found"):
+                policy_url = cookie_audit.get("cookie_policy_url", "")
+                if policy_url:
+                    yield f"✅ **Cookie policy found:** [{policy_url}]({policy_url})\n"
+                else:
+                    yield f"✅ **Cookie policy page found**\n"
+            else:
+                yield f"⚠️ **No dedicated cookie policy page found**\n"
+
+            yield f"\n"
+
+            # Issues
+            issues = cookie_audit.get("issues", [])
+            if issues:
+                yield f"### Issues Detected\n\n"
+                for issue in issues:
+                    yield f"- 🔴 {issue}\n"
+                yield f"\n"
+
+            # Recommendations
+            recommendations = cookie_audit.get("recommendations", [])
+            if recommendations:
+                yield f"### Recommendations\n\n"
+                for rec in recommendations:
+                    yield f"- 💡 {rec}\n"
+                yield f"\n"
+
+            # Cookie details (collapsible)
+            cookies_by_cat = cookie_audit.get("cookies_by_category", {})
+            all_cookies = []
+            for cat, cookies in cookies_by_cat.items():
+                all_cookies.extend(cookies)
+
+            if all_cookies:
+                yield f"<details>\n<summary>View all cookies ({len(all_cookies)} total)</summary>\n\n"
+                yield f"| Cookie Name | Category | Domain | Secure | HttpOnly |\n"
+                yield f"|-------------|----------|--------|--------|----------|\n"
+                for cookie in all_cookies[:30]:
+                    name = cookie.get("name", "Unknown")[:30]
+                    cat = cookie.get("category", "unknown")
+                    domain = cookie.get("domain", "")[:20]
+                    secure = "✅" if cookie.get("secure") else "❌"
+                    httponly = "✅" if cookie.get("httponly") else "❌"
+                    yield f"| {name} | {cat} | {domain} | {secure} | {httponly} |\n"
+                if len(all_cookies) > 30:
+                    yield f"\n*...and {len(all_cookies) - 30} more cookies*\n"
+                yield f"</details>\n\n"
+
+        elif cookie_audit:
+            yield f"---\n\n"
+            yield f"## 🍪 Cookie Compliance Audit\n\n"
+            yield f"✅ **No cookies detected** - website does not appear to set cookies\n\n"
 
         yield f"---\n\n"
 
