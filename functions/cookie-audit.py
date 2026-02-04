@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit
 author: Open WebUI
-version: 1.0.4
+version: 1.0.5
 license: MIT
 description: Audit website cookie usage against ICO (UK Information Commissioner's Office) PECR guidelines. Detects cookies, classifies them, checks for consent mechanisms, and generates compliance reports.
 requirements: aiohttp, beautifulsoup4, lxml, pydantic
@@ -426,12 +426,25 @@ class Pipe:
                                 }
 
                         # Find links for further crawling
-                        if depth < self.valves.CRAWL_DEPTH:
-                            for link in soup.find_all("a", href=True):
-                                href = link["href"]
-                                absolute_url = urljoin(current_url, href)
-                                if urlparse(absolute_url).netloc == domain:
-                                    to_visit.append((absolute_url, depth + 1))
+                        # Prioritize cookie/privacy related links
+                        priority_links = []
+                        normal_links = []
+                        
+                        for link in soup.find_all("a", href=True):
+                            href = link["href"]
+                            absolute_url = urljoin(current_url, href)
+                            if urlparse(absolute_url).netloc == domain:
+                                href_lower = href.lower()
+                                link_text = link.get_text().lower()
+                                # Priority: cookie policy, privacy, legal pages
+                                if any(kw in href_lower or kw in link_text for kw in 
+                                       ["cookie", "privacy", "legal", "policy", "notice", "gdpr", "consent"]):
+                                    priority_links.append((absolute_url, depth + 1))
+                                elif depth < self.valves.CRAWL_DEPTH:
+                                    normal_links.append((absolute_url, depth + 1))
+                        
+                        # Add priority links first (they get crawled first)
+                        to_visit = priority_links + to_visit + normal_links
 
                 except asyncio.TimeoutError:
                     log.warning(f"[CRAWL] Timeout fetching {current_url}")
@@ -638,6 +651,8 @@ class Pipe:
             r"cookie.*privacy",
         ]
 
+        # Log all crawled URLs for debugging
+        log.debug(f"[COOKIE POLICY] Checking {len(pages)} pages for cookie policy")
         for page in pages:
             url_lower = page.get("url", "").lower()
             title_lower = page.get("title", "").lower()
@@ -645,16 +660,26 @@ class Pipe:
 
             # Check if this is a cookie policy page
             is_policy_page = False
-            for keyword in policy_keywords:
-                if keyword in title_lower or keyword in url_lower:
-                    is_policy_page = True
-                    break
+            
+            # Simple check: does URL contain both "cookie" and ("policy" or "notice")
+            if "cookie" in url_lower and ("policy" in url_lower or "notice" in url_lower):
+                is_policy_page = True
+                log.info(f"[COOKIE POLICY] Found via simple URL check: {page.get('url')}")
+            
+            # Check keywords in title or URL
+            if not is_policy_page:
+                for keyword in policy_keywords:
+                    if keyword in title_lower or keyword in url_lower:
+                        is_policy_page = True
+                        log.info(f"[COOKIE POLICY] Found via keyword '{keyword}': {page.get('url')}")
+                        break
 
             # Check URL patterns with regex for more flexibility
             if not is_policy_page:
                 for pattern in policy_url_patterns:
                     if re.search(pattern, url_lower):
                         is_policy_page = True
+                        log.info(f"[COOKIE POLICY] Found via pattern '{pattern}': {page.get('url')}")
                         break
 
             # Also check if URL contains both "cookie" and ("policy" or "notice") anywhere
