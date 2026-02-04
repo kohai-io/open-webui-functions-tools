@@ -313,126 +313,41 @@ class Pipe:
         """Run the audit using Playwright with HAR capture
         
         Based on EDPB WAT mcp-server.ts auditUrl function
+        
+        Note: Uses sync Playwright in a thread pool to avoid Windows asyncio subprocess issues
         """
-        from playwright.async_api import async_playwright
+        import concurrent.futures
         
-        har_data = None
-        cookies = []
-        local_storage = {}
-        session_storage = {}
-        requests_log = []
+        # Run Playwright in a thread pool to avoid Windows asyncio subprocess issues
+        # WindowsSelectorEventLoop doesn't support subprocess_exec which Playwright needs
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            result = await loop.run_in_executor(
+                executor,
+                self._run_playwright_sync,
+                url,
+            )
+        
+        # Unpack result and run async post-processing
+        (
+            cookies, local_storage, session_storage, requests_log,
+            third_party_hosts, page_title, har_data
+        ) = result
+        
+        # Analyze trackers from requests (can be done async)
         trackers = []
-        third_party_hosts = set()
-        consent_detected = False
-        cookie_policy_url = None
-        page_title = ""
-        screenshot_path = None
-        
-        async with async_playwright() as p:
-            # Connect to remote browser or launch local
-            if self.valves.PLAYWRIGHT_WS_URL:
-                log.info(f"[COOKIE AUDIT PW] Connecting to remote browser: {self.valves.PLAYWRIGHT_WS_URL}")
-                browser = await p.chromium.connect(self.valves.PLAYWRIGHT_WS_URL)
-            else:
-                log.info("[COOKIE AUDIT PW] Launching local browser")
-                browser = await p.chromium.launch(headless=self.valves.HEADLESS)
-            
-            try:
-                # Create temp file for HAR
-                har_path = tempfile.mktemp(suffix=".har")
-                
-                # Create context with HAR recording (like EDPB WAT)
-                context = await browser.new_context(
-                    user_agent=self.valves.USER_AGENT,
-                    record_har_path=har_path,
-                    record_har_content="omit",  # Don't record response bodies
-                    ignore_https_errors=True,
-                )
-                
-                # Track requests for tracker detection
-                page = await context.new_page()
-                
-                # Set up request interception for tracker detection
-                main_domain = urlparse(url).netloc
-                
-                async def handle_request(request):
-                    request_url = request.url
-                    requests_log.append({
-                        "url": request_url,
-                        "method": request.method,
-                        "resource_type": request.resource_type,
-                    })
-                    
-                    # Check for third-party hosts
-                    request_domain = urlparse(request_url).netloc
-                    if request_domain and request_domain != main_domain:
-                        third_party_hosts.add(request_domain)
-                    
-                    # Check for trackers
-                    if self.valves.ENABLE_TRACKER_DETECTION:
-                        for pattern in self.tracker_patterns:
-                            if pattern.search(request_url):
-                                trackers.append({
-                                    "url": request_url,
-                                    "pattern": pattern.pattern,
-                                    "type": self._get_tracker_type(request_url),
-                                })
-                                break
-                
-                page.on("request", handle_request)
-                
-                if event_emitter:
-                    await event_emitter(
-                        {"type": "status", "data": {"description": f"Navigating to {url}...", "done": False}}
-                    )
-                
-                # Navigate to page
-                log.info(f"[COOKIE AUDIT PW] Navigating to {url}")
-                response = await page.goto(url, wait_until="networkidle", timeout=self.valves.PAGE_TIMEOUT_MS)
-                
-                if response:
-                    log.info(f"[COOKIE AUDIT PW] Page loaded with status {response.status}")
-                
-                # Wait for JS cookies to be set
-                await page.wait_for_timeout(self.valves.WAIT_AFTER_LOAD_MS)
-                
-                # Get page title
-                page_title = await page.title()
-                
-                if event_emitter:
-                    await event_emitter(
-                        {"type": "status", "data": {"description": "Collecting cookies and storage...", "done": False}}
-                    )
-                
-                # Collect cookies (HTTP + JS)
-                cookies = await context.cookies()
-                log.info(f"[COOKIE AUDIT PW] Found {len(cookies)} cookies")
-                
-                # Collect localStorage and sessionStorage
-                try:
-                    local_storage = await page.evaluate("() => Object.assign({}, localStorage)")
-                    session_storage = await page.evaluate("() => Object.assign({}, sessionStorage)")
-                except Exception as e:
-                    log.warning(f"[COOKIE AUDIT PW] Could not access storage: {e}")
-                
-                # Detect consent mechanism
-                consent_detected = await self._detect_consent_mechanism(page)
-                
-                # Look for cookie policy link
-                cookie_policy_url = await self._find_cookie_policy_link(page, url)
-                
-                # Close context to finalize HAR
-                await context.close()
-                
-                # Read HAR file
-                if os.path.exists(har_path):
-                    with open(har_path, 'r', encoding='utf-8') as f:
-                        har_data = json.load(f)
-                    os.remove(har_path)
-                    log.info(f"[COOKIE AUDIT PW] HAR captured with {len(har_data.get('log', {}).get('entries', []))} entries")
-                
-            finally:
-                await browser.close()
+        if self.valves.ENABLE_TRACKER_DETECTION:
+            main_domain = urlparse(url).netloc
+            for req in requests_log:
+                req_url = req.get("url", "")
+                for pattern in self.tracker_patterns:
+                    if pattern.search(req_url):
+                        trackers.append({
+                            "url": req_url,
+                            "pattern": pattern.pattern,
+                            "type": self._get_tracker_type(req_url),
+                        })
+                        break
         
         # Analyze collected data
         if event_emitter:
@@ -445,6 +360,10 @@ class Pipe:
         
         # Analyze HAR for additional insights
         har_analysis = self._analyze_har(har_data) if har_data else {}
+        
+        # Check for consent (from page snapshot stored in har_data)
+        consent_detected = har_data.get("_consent_detected", False) if har_data else False
+        cookie_policy_url = har_data.get("_cookie_policy_url") if har_data else None
         
         # Assess ICO compliance
         compliance = self._assess_compliance(
@@ -472,10 +391,119 @@ class Pipe:
             "audit_time": datetime.now().isoformat(),
         }
 
-    async def _detect_consent_mechanism(self, page) -> bool:
-        """Detect if a cookie consent mechanism is present"""
+    def _run_playwright_sync(self, url: str) -> tuple:
+        """Run Playwright synchronously in a thread pool
+        
+        This avoids Windows asyncio subprocess issues with WindowsSelectorEventLoop
+        """
+        from playwright.sync_api import sync_playwright
+        
+        har_data = None
+        cookies = []
+        local_storage = {}
+        session_storage = {}
+        requests_log = []
+        third_party_hosts = set()
+        page_title = ""
+        consent_detected = False
+        cookie_policy_url = None
+        
+        with sync_playwright() as p:
+            # Connect to remote browser or launch local
+            if self.valves.PLAYWRIGHT_WS_URL:
+                log.info(f"[COOKIE AUDIT PW] Connecting to remote browser: {self.valves.PLAYWRIGHT_WS_URL}")
+                browser = p.chromium.connect(self.valves.PLAYWRIGHT_WS_URL)
+            else:
+                log.info("[COOKIE AUDIT PW] Launching local browser")
+                browser = p.chromium.launch(headless=self.valves.HEADLESS)
+            
+            try:
+                # Create temp file for HAR
+                har_path = tempfile.mktemp(suffix=".har")
+                
+                # Create context with HAR recording (like EDPB WAT)
+                context = browser.new_context(
+                    user_agent=self.valves.USER_AGENT,
+                    record_har_path=har_path,
+                    record_har_content="omit",  # Don't record response bodies
+                    ignore_https_errors=True,
+                )
+                
+                # Track requests for tracker detection
+                page = context.new_page()
+                
+                # Set up request interception for tracker detection
+                main_domain = urlparse(url).netloc
+                
+                def handle_request(request):
+                    request_url = request.url
+                    requests_log.append({
+                        "url": request_url,
+                        "method": request.method,
+                        "resource_type": request.resource_type,
+                    })
+                    
+                    # Check for third-party hosts
+                    request_domain = urlparse(request_url).netloc
+                    if request_domain and request_domain != main_domain:
+                        third_party_hosts.add(request_domain)
+                
+                page.on("request", handle_request)
+                
+                # Navigate to page
+                log.info(f"[COOKIE AUDIT PW] Navigating to {url}")
+                response = page.goto(url, wait_until="networkidle", timeout=self.valves.PAGE_TIMEOUT_MS)
+                
+                if response:
+                    log.info(f"[COOKIE AUDIT PW] Page loaded with status {response.status}")
+                
+                # Wait for JS cookies to be set
+                page.wait_for_timeout(self.valves.WAIT_AFTER_LOAD_MS)
+                
+                # Get page title
+                page_title = page.title()
+                
+                # Collect cookies (HTTP + JS)
+                cookies = context.cookies()
+                log.info(f"[COOKIE AUDIT PW] Found {len(cookies)} cookies")
+                
+                # Collect localStorage and sessionStorage
+                try:
+                    local_storage = page.evaluate("() => Object.assign({}, localStorage)")
+                    session_storage = page.evaluate("() => Object.assign({}, sessionStorage)")
+                except Exception as e:
+                    log.warning(f"[COOKIE AUDIT PW] Could not access storage: {e}")
+                
+                # Detect consent mechanism
+                consent_detected = self._detect_consent_mechanism_sync(page)
+                
+                # Look for cookie policy link
+                cookie_policy_url = self._find_cookie_policy_link_sync(page, url)
+                
+                # Close context to finalize HAR
+                context.close()
+                
+                # Read HAR file
+                if os.path.exists(har_path):
+                    with open(har_path, 'r', encoding='utf-8') as f:
+                        har_data = json.load(f)
+                    # Store consent/policy in har_data for return
+                    har_data["_consent_detected"] = consent_detected
+                    har_data["_cookie_policy_url"] = cookie_policy_url
+                    os.remove(har_path)
+                    log.info(f"[COOKIE AUDIT PW] HAR captured with {len(har_data.get('log', {}).get('entries', []))} entries")
+                
+            finally:
+                browser.close()
+        
+        return (
+            cookies, local_storage, session_storage, requests_log,
+            third_party_hosts, page_title, har_data
+        )
+
+    def _detect_consent_mechanism_sync(self, page) -> bool:
+        """Detect if a cookie consent mechanism is present (sync version)"""
         consent_selectors = [
-            # Common consent banner selectors
             '[class*="cookie-consent"]',
             '[class*="cookie-banner"]',
             '[class*="cookie-notice"]',
@@ -491,8 +519,7 @@ class Pipe:
             '[id*="CybotCookiebotDialog"]',
             '[class*="cc-banner"]',
             '[class*="cc-window"]',
-            # Common CMP platforms
-            '[id*="sp_message_container"]',  # Sourcepoint
+            '[id*="sp_message_container"]',
             '[id*="cmp"]',
             '[class*="cmp-"]',
             '[data-testid*="cookie"]',
@@ -502,9 +529,9 @@ class Pipe:
         
         for selector in consent_selectors:
             try:
-                element = await page.query_selector(selector)
+                element = page.query_selector(selector)
                 if element:
-                    is_visible = await element.is_visible()
+                    is_visible = element.is_visible()
                     if is_visible:
                         log.info(f"[COOKIE AUDIT PW] Consent mechanism detected: {selector}")
                         return True
@@ -513,7 +540,7 @@ class Pipe:
         
         # Also check for consent-related text
         try:
-            page_text = await page.inner_text("body")
+            page_text = page.inner_text("body")
             consent_phrases = [
                 "we use cookies",
                 "this website uses cookies",
@@ -531,8 +558,8 @@ class Pipe:
         
         return False
 
-    async def _find_cookie_policy_link(self, page, base_url: str) -> Optional[str]:
-        """Find cookie policy page link"""
+    def _find_cookie_policy_link_sync(self, page, base_url: str) -> Optional[str]:
+        """Find cookie policy page link (sync version)"""
         policy_patterns = [
             r"cookie.*policy",
             r"cookie.*notice",
@@ -541,10 +568,10 @@ class Pipe:
         ]
         
         try:
-            links = await page.query_selector_all("a[href]")
+            links = page.query_selector_all("a[href]")
             for link in links:
-                href = await link.get_attribute("href")
-                text = await link.inner_text()
+                href = link.get_attribute("href")
+                text = link.inner_text()
                 
                 if not href:
                     continue
