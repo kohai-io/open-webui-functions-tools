@@ -1,7 +1,7 @@
 """
 title: Cookie Compliance Audit (Playwright)
 author: Open WebUI
-version: 1.0.8
+version: 1.1.0
 license: MIT
 description: Advanced cookie compliance audit using Playwright for real browser rendering. Captures HTTP and JavaScript cookies, detects trackers using EasyPrivacy lists, analyzes third-party requests, and generates ICO PECR compliance reports. Based on EDPB Website Auditing Tool (EUPL-1.2).
 requirements: playwright, aiohttp, pydantic, adblockparser
@@ -22,13 +22,18 @@ import re
 import os
 import tempfile
 from datetime import datetime
-from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Awaitable, Set
 from urllib.parse import urljoin, urlparse, parse_qs
 import ipaddress
 import socket
 
 from pydantic import BaseModel, Field
+
+# Try to import EncryptedStr for secure API key storage
+try:
+    from open_webui.utils.misc import EncryptedStr
+except ImportError:
+    EncryptedStr = str  # Fallback if not available
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
@@ -42,10 +47,6 @@ class Pipe:
 
     # Class-level cache to prevent duplicate runs
     _active_audits = {}
-    
-    # EasyPrivacy patterns cache
-    _easyprivacy_rules = None
-    _fanboy_rules = None
 
     class Valves(BaseModel):
         """Configuration options for the cookie audit"""
@@ -82,21 +83,22 @@ class Pipe:
             default=True,
             description="Enable tracker detection using EasyPrivacy/Fanboy lists",
         )
+        # TODO: LLM analysis feature not yet implemented
         ENABLE_LLM_ANALYSIS: bool = Field(
             default=False,
-            description="Use LLM to analyze cookie policy quality",
+            description="Use LLM to analyze cookie policy quality (not yet implemented)",
         )
         LLM_MODEL: str = Field(
             default="gpt-4o-mini",
-            description="LLM model for analysis",
+            description="LLM model for analysis (not yet implemented)",
         )
-        OPENAI_API_KEY: str = Field(
+        OPENAI_API_KEY: EncryptedStr = Field(
             default="",
-            description="OpenAI API key for LLM analysis",
+            description="OpenAI API key for LLM analysis (encrypted, not yet implemented)",
         )
         OPENAI_BASE_URL: str = Field(
             default="https://api.openai.com/v1",
-            description="OpenAI API base URL",
+            description="OpenAI API base URL (not yet implemented)",
         )
         DEBUG_MODE: bool = Field(
             default=False,
@@ -433,9 +435,12 @@ class Pipe:
                     ]
                 )
             
+            # Create temp file for HAR using NamedTemporaryFile (mktemp is deprecated)
+            har_file = tempfile.NamedTemporaryFile(suffix=".har", delete=False)
+            har_path = har_file.name
+            har_file.close()
+            
             try:
-                # Create temp file for HAR
-                har_path = tempfile.mktemp(suffix=".har")
                 
                 # Create context with HAR recording and anti-detection settings
                 context = browser.new_context(
@@ -596,6 +601,12 @@ class Pipe:
                     log.info(f"[COOKIE AUDIT PW] HAR captured with {len(har_data.get('log', {}).get('entries', []))} entries")
                 
             finally:
+                # Clean up HAR file if it still exists
+                if os.path.exists(har_path):
+                    try:
+                        os.remove(har_path)
+                    except Exception:
+                        pass
                 browser.close()
         
         return (
@@ -991,7 +1002,7 @@ class Pipe:
                     else:
                         try:
                             expires_str = datetime.fromtimestamp(expires).strftime("%Y-%m-%d")
-                        except:
+                        except Exception:
                             expires_str = str(expires)
                     
                     yield f"| `{cookie['name'][:30]}` | {cookie['domain'][:25]} | {expires_str} | {'✅' if cookie.get('secure') else '❌'} | {'✅' if cookie.get('httpOnly') else '❌'} |\n"
