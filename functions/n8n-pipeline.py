@@ -159,6 +159,15 @@ class Pipe:
         self.log = logging.getLogger("n8n_pipeline")
         self.log.setLevel(SRC_LOG_LEVELS.get("OPENAI", logging.INFO))
 
+    def _decrypt_valve_value(self, value: Any) -> str:
+        """
+        Safely decrypt a valve value whether Open WebUI provides it as
+        an EncryptedStr instance or a plain string.
+        """
+        if not value:
+            return ""
+        return EncryptedStr.decrypt(str(value))
+
     async def emit_status(
         self,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]],
@@ -205,34 +214,18 @@ class Pipe:
         """
         headers = {"Content-Type": "application/json"}
         # Add bearer token if available
-        bearer_token = self.valves.N8N_BEARER_TOKEN
+        bearer_token = self._decrypt_valve_value(self.valves.N8N_BEARER_TOKEN)
         if bearer_token:
-            # Handle both EncryptedStr objects and plain strings
-            if hasattr(bearer_token, 'get_decrypted'):
-                bearer_token = bearer_token.get_decrypted()
-            else:
-                bearer_token = EncryptedStr.decrypt(str(bearer_token))
-            if bearer_token:
-                headers["Authorization"] = f"Bearer {bearer_token}"
+            headers["Authorization"] = f"Bearer {bearer_token}"
         # Add Cloudflare Access headers if available
-        cf_client_id = self.valves.CF_ACCESS_CLIENT_ID
+        cf_client_id = self._decrypt_valve_value(self.valves.CF_ACCESS_CLIENT_ID)
         if cf_client_id:
-            # Handle both EncryptedStr objects and plain strings
-            if hasattr(cf_client_id, 'get_decrypted'):
-                cf_client_id = cf_client_id.get_decrypted()
-            else:
-                cf_client_id = EncryptedStr.decrypt(str(cf_client_id))
-            if cf_client_id:
-                headers["CF-Access-Client-Id"] = cf_client_id
-        cf_client_secret = self.valves.CF_ACCESS_CLIENT_SECRET
+            headers["CF-Access-Client-Id"] = cf_client_id
+        cf_client_secret = self._decrypt_valve_value(
+            self.valves.CF_ACCESS_CLIENT_SECRET
+        )
         if cf_client_secret:
-            # Handle both EncryptedStr objects and plain strings
-            if hasattr(cf_client_secret, 'get_decrypted'):
-                cf_client_secret = cf_client_secret.get_decrypted()
-            else:
-                cf_client_secret = EncryptedStr.decrypt(str(cf_client_secret))
-            if cf_client_secret:
-                headers["CF-Access-Client-Secret"] = cf_client_secret
+            headers["CF-Access-Client-Secret"] = cf_client_secret
         # Request streaming if available, but still accept JSON
         headers.setdefault(
             "Accept", "text/event-stream, application/x-ndjson, application/json"
