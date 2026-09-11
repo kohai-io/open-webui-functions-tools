@@ -1,746 +1,629 @@
 """
-title: RunwayML Image-to-Video Pipeline (Inline Display)
+title: Runway Video Generation (Inline)
 author: open-webui
-date: 2025-09-27
-version: 2.1
+version: 3.0.0
 license: MIT
-description: A pipeline for generating videos from images using RunwayML's image-to-video API with inline video display
-requirements: aiohttp, cryptography, pydantic
-
-USAGE
-- Attach an image (drag/drop) or reference an Open WebUI file URL like /api/v1/files/{id}/content.
-- Provide a text instruction describing camera motion, look, and style.
-- The generated video will be displayed inline in the chat message.
-
-PER-MESSAGE OVERRIDES
-You can override key parameters directly in your prompt (the block is stripped before sending to Runway):
-- JSON block at the end:
-  {"duration": 10, "ratio": "16:9", "model": "gen4_turbo"}
-- Tag form:
-  <runway duration="10" ratio="16:9" model="gen4_turbo" />
-Keys supported: duration, ratio, model.
+description: Standalone Runway text/image-to-video Pipe with Seedance 2.5, Gen-4.5 and Gen-4 Turbo, optional option dialogs, confirmation, and user-owned Files API players. Enable iframe Sandbox Allow Same Origin for playback.
+requirements: httpx, cryptography, pydantic
 """
 
-from typing import Optional, Callable, Awaitable, Any
-from pydantic import BaseModel, Field, GetCoreSchemaHandler
-from cryptography.fernet import Fernet, InvalidToken
-import time
-import aiohttp
 import asyncio
-import json
-import os
 import base64
 import hashlib
-import logging
-import re
-import mimetypes
-import tempfile
-import uuid
-from pydantic_core import core_schema
-from open_webui.routers.images import upload_image, load_b64_image_data
-from open_webui.routers.files import upload_file_handler
-from open_webui.models.users import Users
-from open_webui.models.files import Files as FilesDB
-from open_webui.storage.provider import Storage
-from fastapi import UploadFile
 import io
+import ipaddress
+import json
+import logging
+import mimetypes
+import os
+import re
+import time
+from html import escape
+from typing import Any, Literal, Optional
+from urllib.parse import urlsplit
+from uuid import UUID
 
-# Simplified encryption implementation with automatic handling
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from pydantic import BaseModel, Field, GetCoreSchemaHandler
+from pydantic_core import core_schema
+
+
 class EncryptedStr(str):
-    """A string type that automatically handles encryption/decryption"""
-    @classmethod
-    def _get_encryption_key(cls) -> Optional[bytes]:
-        """Generate encryption key from WEBUI_SECRET_KEY if available"""
+    """Compatible with the previous Pipe's encrypted credential valve."""
+    @staticmethod
+    def _key():
         secret = os.getenv("WEBUI_SECRET_KEY")
-        if not secret:
-            return None
-        hashed_key = hashlib.sha256(secret.encode()).digest()
-        return base64.urlsafe_b64encode(hashed_key)
+        return base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()) if secret else None
 
     @classmethod
-    def encrypt(cls, value: str) -> str:
-        """Encrypt a string value if a key is available"""
-        if not value or value.startswith("encrypted:"):
+    def encrypt(cls, value):
+        if not value or value.startswith("encrypted:") or not cls._key():
             return value
-        key = cls._get_encryption_key()
-        if not key:
-            return value
-        f = Fernet(key)
-        encrypted = f.encrypt(value.encode())
-        return f"encrypted:{encrypted.decode()}"
+        return "encrypted:" + Fernet(cls._key()).encrypt(value.encode()).decode()
 
     @classmethod
-    def decrypt(cls, value: str) -> str:
-        """Decrypt an encrypted string value if a key is available"""
-        if not value or not value.startswith("encrypted:"):
+    def decrypt(cls, value):
+        if not value.startswith("encrypted:"):
             return value
-        key = cls._get_encryption_key()
-        if not key:
-            return value[len("encrypted:"):]
         try:
-            encrypted_part = value[len("encrypted:"):]
-            f = Fernet(key)
-            decrypted = f.decrypt(encrypted_part.encode())
-            return decrypted.decode()
-        except (InvalidToken, Exception):
-            return value
+            if not cls._key():
+                raise ValueError("WEBUI_SECRET_KEY is unavailable")
+            return Fernet(cls._key()).decrypt(value[10:].encode()).decode()
+        except (InvalidToken, ValueError):
+            raise ValueError("Cannot decrypt RUNWAY_API_KEY. Restore WEBUI_SECRET_KEY or re-enter the key.") from None
 
     @classmethod
-    def __get_pydantic_core_schema__(
-        cls, _source_type: Any, _handler: GetCoreSchemaHandler
-    ) -> core_schema.CoreSchema:
-        return core_schema.union_schema(
-            [
-                core_schema.is_instance_schema(cls),
-                core_schema.chain_schema(
-                    [
-                        core_schema.str_schema(),
-                        core_schema.no_info_plain_validator_function(
-                            lambda value: cls(cls.encrypt(value) if value else value)
-                        ),
-                    ]
-                ),
-            ],
-            serialization=core_schema.plain_serializer_function_ser_schema(
-                lambda instance: str(instance)
-            ),
+    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler):
+        return core_schema.no_info_after_validator_function(
+            lambda v: cls(cls.encrypt(v)), core_schema.str_schema(),
+            serialization=core_schema.to_string_ser_schema(),
         )
 
-    def get_decrypted(self) -> str:
-        """Get the decrypted value"""
-        return self.decrypt(self)
+
+class UserCancelled(Exception):
+    pass
+
+
+class RunwayError(Exception):
+    def __init__(self, message, status=None, retry_after=5):
+        super().__init__(message)
+        self.status, self.retry_after = status, retry_after
+
+
+# Model pixel ratios from Runway's published OpenAPI schema, checked 2026-09-11.
+SHAPES = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
+SEEDANCE_RATIOS = {
+    "480p": dict(zip(SHAPES, ("992:432", "854:480", "752:560", "640:640", "560:752", "480:854"))),
+    "720p": dict(zip(SHAPES, ("1470:630", "1280:720", "1112:834", "960:960", "834:1112", "720:1280"))),
+    "1080p": dict(zip(SHAPES, ("2206:946", "1920:1080", "1664:1248", "1440:1440", "1248:1664", "1080:1920"))),
+}
+GEN4_RATIOS = dict(zip(SHAPES, ("1584:672", "1280:720", "1104:832", "960:960", "832:1104", "720:1280")))
+MODELS = {"seedance2_5": "Seedance 2.5", "gen4.5": "Runway Gen-4.5", "gen4_turbo": "Runway Gen-4 Turbo"}
+IMAGE_MIMES = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp"}
 
 
 class Pipe:
     class Valves(BaseModel):
-        RUNWAY_API_KEY: EncryptedStr = Field(
-            default="",
-            description="RunwayML API key for authentication. Get it from https://app.runwayml.com/",
-        )
-        API_BASE_URL: str = Field(
-            default="https://api.dev.runwayml.com/v1",
-            description="RunwayML API base URL.",
-        )
-        MODEL: str = Field(
-            default="gen4_turbo",
-            description="The RunwayML model to use (gen4_turbo, gen4).",
-        )
-        DURATION: int = Field(
-            default=5,
-            description="Video duration in seconds (1-10).",
-        )
-        RATIO: str = Field(
-            default="1280:720",
-            description="Video aspect ratio (1280:720, 768:768, 512:768, etc.).",
-        )
-        POLL_INTERVAL: int = Field(
-            default=5,
-            description="Seconds between status checks for video generation (default: 5).",
-        )
-        MAX_POLL_TIME: int = Field(
-            default=300,
-            description="Maximum time in seconds to wait for video generation (default: 300 = 5 minutes).",
-        )
-        EMIT_INTERVAL: float = Field(
-            default=0.5, description="Interval in seconds between status emissions"
-        )
-        ENABLE_STATUS_INDICATOR: bool = Field(
-            default=True, description="Enable or disable status indicator emissions"
-        )
-        PROGRESS_UPDATE_INTERVALS: str = Field(
-            default="15,30,60,120",
-            description="Comma-separated seconds for progressive status updates (e.g., '15,30,60,120')"
-        )
+        RUNWAY_API_KEY: EncryptedStr = Field(default="", description="Runway developer API key. Falls back to RUNWAYML_API_SECRET. Encrypted when WEBUI_SECRET_KEY is set.")
+        API_BASE_URL: str = Field(default="https://api.dev.runwayml.com/v1", description="Runway developer API base. Must use HTTPS.")
+        MODEL: Literal["seedance2_5", "gen4.5", "gen4_turbo"] = "seedance2_5"
+        DURATION: int = Field(default=5, ge=2, le=30, description="Default seconds. Seedance: 4–30; Gen-4.5/Turbo: 2–10.")
+        RATIO: str = Field(default="1280:720", description="Default model pixel ratio, e.g. 1280:720 or 1920:1080. User Valves override shape and resolution.")
+        REQUIRE_CONFIRMATION: bool = Field(default=True, description="Require a positive OWUI confirmation before sending the prompt or image to Runway. API-only calls cannot confirm.")
+        EVENT_TIMEOUT: int = Field(default=180, ge=10, le=1800, description="Maximum seconds per dialog. Timeout cancels generation.")
+        POLL_INTERVAL: int = Field(default=5, ge=5, le=60)
+        MAX_POLL_TIME: int = Field(default=900, ge=30, le=3600)
+        DOWNLOAD_TIMEOUT: int = Field(default=180, ge=10, le=600)
+        MAX_INPUT_MB: int = Field(default=20, ge=1, le=200, description="Maximum image bytes read from OWUI or data URIs.")
+        MAX_VIDEO_MB: int = Field(default=256, ge=1, le=1024, description="Maximum bytes downloaded per video. OWUI's upload limit also applies.")
+        ENABLE_STATUS_INDICATOR: bool = True
+
+    class UserValves(BaseModel):
+        MODEL: Literal["default", "seedance2_5", "gen4.5", "gen4_turbo"] = "default"
+        DURATION: int = Field(default=0, ge=0, le=30, description="Seconds, or 0 to use the administrator default.")
+        ASPECT_RATIO: Literal["default", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"] = "default"
+        RESOLUTION: Literal["default", "480p", "720p", "1080p"] = "default"
+        AUDIO: bool = Field(default=True, description="Generate audio with Seedance 2.5. Gen-4 models do not accept this option.")
+        ASK_OPTIONS: bool = Field(default=False, description="Show model, format, duration and audio selection dialogs before confirmation.")
 
     def __init__(self):
-        self.name = "RunwayML Image-to-Video (Inline)"
+        self.name = "Runway Video (Inline)"
         self.valves = self.Valves()
-        self.last_emit_time = 0
-        self.log = logging.getLogger("runway_inline_pipeline")
-        self.log.setLevel(logging.INFO)
+        self.log = logging.getLogger("runway_inline")
 
-    async def emit_status(
-        self,
-        event_emitter: Optional[Callable[[dict], Awaitable[None]]],
-        level: str,
-        message: str,
-        done: bool = False,
-    ) -> None:
-        """Emit status updates to Open WebUI"""
-        if not event_emitter:
-            return
-        
-        if not self.valves.ENABLE_STATUS_INDICATOR:
-            return
-
-        current_time = time.time()
-        if current_time - self.last_emit_time >= self.valves.EMIT_INTERVAL or done:
+    async def _status(self, emitter, message, done=False):
+        if emitter and self.valves.ENABLE_STATUS_INDICATOR:
             try:
-                await event_emitter(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": message,
-                            "done": done,
-                        },
-                    }
-                )
-                self.last_emit_time = current_time
-            except Exception as e:
-                self.log.warning(f"Failed to emit status: {e}")
+                await emitter({"type": "status", "data": {"description": message, "done": done}})
+            except Exception:
+                self.log.warning("Status delivery failed")
 
-    async def pipe(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __event_emitter__: Callable[[dict], Awaitable[None]] = None,
-        __event_call__: Callable[[dict], Awaitable[dict]] = None,
-    ) -> Optional[dict]:
-        """Main pipeline method for RunwayML image-to-video generation with inline display.
+    def _options(self, context):
+        raw = (context or {}).get("valves")
+        if isinstance(raw, BaseModel):
+            raw = raw.model_dump()
+        prefs = self.UserValves.model_validate(raw or {})
+        model = self.valves.MODEL if prefs.MODEL == "default" else prefs.MODEL
+        choices = [(res, shape) for res, ratios in SEEDANCE_RATIOS.items() for shape, px in ratios.items() if px == self.valves.RATIO]
+        choices += [("720p", shape) for shape, px in GEN4_RATIOS.items() if px == self.valves.RATIO]
+        if not choices:
+            raise ValueError("Set the administrator RATIO to a supported pixel ratio such as 1280:720.")
+        resolution, shape = choices[0]
+        return {
+            "model": model, "duration": prefs.DURATION or self.valves.DURATION,
+            "aspect_ratio": shape if prefs.ASPECT_RATIO == "default" else prefs.ASPECT_RATIO,
+            "resolution": resolution if prefs.RESOLUTION == "default" else prefs.RESOLUTION,
+            "audio": prefs.AUDIO if model == "seedance2_5" else False,
+        }, prefs.ASK_OPTIONS
 
-        Returns the full body dict with an appended assistant message so the
-        frontend can render attached files (video) properly, consistent with
-        other pipelines like nano_banana_chat.
-        """
-        await self.emit_status(
-            __event_emitter__, "info", "Initializing RunwayML video generation..."
-        )
-        
-        # Decrypt API key
-        api_key = self.valves.RUNWAY_API_KEY.get_decrypted()
-        if not api_key:
-            error_msg = "RunwayML API key not configured. Please set RUNWAY_API_KEY in the pipeline settings."
-            await self.emit_status(__event_emitter__, "error", f"❌ Error: {error_msg}", True)
-            self.log.error(error_msg)
-            body["messages"].append({"role": "assistant", "content": f"❌ Error: {error_msg}"})
-            return body
+    @staticmethod
+    def _formats(model, has_image):
+        if model == "seedance2_5":
+            return SEEDANCE_RATIOS
+        ratios = GEN4_RATIOS if has_image else {s: GEN4_RATIOS[s] for s in ("16:9", "9:16")}
+        return {"720p": ratios}
 
-        # Extract prompt and image from the latest USER message (guarded)
-        messages = body.get("messages", [])
-        prompt = self._extract_latest_user_prompt(messages)
-        image_ref = None
-
-        if messages:
-            for msg in reversed(messages):
-                if msg.get("role") == "user":
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        # Handle multimodal content (text + image)
-                        for item in content:
-                            if item.get("type") == "image_url":
-                                image_ref = item.get("image_url", {}).get("url", "")
-                            elif item.get("type") in {"file", "input_image", "input_file"}:
-                                # Accept generic file items if they look like images
-                                meta = item.get("file", {}) or item
-                                url = meta.get("url") or meta.get("image_url", {}).get("url", "")
-                                mime = meta.get("mime") or meta.get("mime_type")
-                                if url and (not mime or str(mime).startswith("image/")):
-                                    image_ref = url
-                    break
-
-        if not prompt:
-            error_msg = "No prompt provided for video generation."
-            await self.emit_status(__event_emitter__, "error", f"❌ Error: {error_msg}", True)
-            body["messages"].append(
-                {"role": "assistant", "content": f"❌ Error: {error_msg}"}
-            )
-            return f"❌ Error: {error_msg}"
-
-        if not image_ref:
-            # Fallback: search previous messages for image references
-            for prev in reversed(messages[:-1]):
-                c = prev.get("content", "")
-                if isinstance(c, str):
-                    urls = self._extract_images_from_content(c)
-                    if urls:
-                        image_ref = urls[0]
-                        break
-                elif isinstance(c, list):
-                    # Support multimodal older messages
-                    for item in c:
-                        if isinstance(item, dict) and item.get("type") == "image_url":
-                            u = item.get("image_url", {}).get("url", "")
-                            if u:
-                                image_ref = u
-                                break
-                    if image_ref:
-                        break
-
-        if not image_ref:
-            error_msg = "No image provided for video generation. Please upload an image."
-            await self.emit_status(__event_emitter__, "error", f"❌ Error: {error_msg}", True)
-            body["messages"].append(
-                {"role": "assistant", "content": f"❌ Error: {error_msg}"}
-            )
-            return f"❌ Error: {error_msg}"
-
-        # Resolve image reference
-        await self.emit_status(
-            __event_emitter__, "info", "Processing reference image..."
-        )
-        prompt_image = self._resolve_prompt_image(image_ref)
-        if not prompt_image:
-            error_msg = "The provided image cannot be accessed by RunwayML. Please provide a public http(s) URL or use a file saved in Open WebUI."
-            await self.emit_status(__event_emitter__, "error", f"❌ Error: {error_msg}", True)
-            self.log.error(error_msg)
-            body["messages"].append({"role": "assistant", "content": f"❌ Error: {error_msg}"})
-            return body
-
-        # Parse inline parameter overrides and normalize params
-        cleaned_prompt, inline_overrides = self._parse_inline_overrides(prompt)
-        prompt = cleaned_prompt
-        params = self._normalize_params(inline_overrides)
-
+    def _payload(self, prompt, image, options):
+        model = options["model"]
+        if model not in MODELS:
+            raise ValueError("Select Seedance 2.5, Gen-4.5 or Gen-4 Turbo.")
+        if model == "gen4_turbo" and not image:
+            raise ValueError("Gen-4 Turbo requires an image. Attach one or select Seedance 2.5 / Gen-4.5.")
+        minimum, maximum = (4, 30) if model == "seedance2_5" else (2, 10)
+        duration = options["duration"]
+        if isinstance(duration, bool) or not isinstance(duration, int) or not minimum <= duration <= maximum:
+            raise ValueError(f"{MODELS[model]} requires {minimum}–{maximum} whole seconds.")
         try:
-            self.log.info(f"Starting RunwayML video generation with prompt: {prompt[:100]}...")
+            ratio = self._formats(model, bool(image))[options["resolution"]][options["aspect_ratio"]]
+        except KeyError:
+            raise ValueError("This model/mode does not support the selected format. Enable ASK_OPTIONS or change the User Valves.") from None
+        limit = 15000 if model == "seedance2_5" else 1000
+        if len(prompt.encode("utf-16-le")) // 2 > limit:
+            raise ValueError(f"This model accepts a prompt of at most {limit} UTF-16 characters. Shorten the prompt.")
+        if not prompt and (not image or model == "gen4.5"):
+            raise ValueError("Describe the video you want to generate.")
+        payload = {"model": model, "ratio": ratio, "duration": duration}
+        if prompt:
+            payload["promptText"] = prompt
+        if model == "seedance2_5":
+            payload["audio"] = options["audio"]
+        if image:
+            payload["promptImage"] = [{"uri": image, "position": "first"}]
+        return ("image_to_video" if image else "text_to_video"), payload
 
-            await self.emit_status(
-                __event_emitter__, "info", "Starting video generation with RunwayML..."
-            )
-            # Start video generation
-            task_id = await self._start_video_generation(
-                prompt, prompt_image, api_key, params["model"], 
-                params["duration"], params["ratio"], params["api_base_url"]
-            )
-
-            if not task_id:
-                raise Exception("Failed to start video generation. Please check your API key and image URL.")
-
-            await self.emit_status(
-                __event_emitter__, "info", "Video generation in progress (this may take several minutes)..."
-            )
-            # Poll for completion
-            video_url = await self._poll_video_status(task_id, api_key, params["api_base_url"], __event_emitter__)
-
-            if video_url:
-                await self.emit_status(
-                    __event_emitter__, "info", "Downloading generated video..."
-                )
-                # Download video bytes
-                video_data = await self._download_video(video_url, api_key)
-
-                if video_data:
-                    await self.emit_status(
-                        __event_emitter__, "info", "Saving video file..."
-                    )
-                    # Save video once via OWUI storage
-                    user_id = __user__.get("id") if __user__ else None
-                    saved_video_id = await self._save_video_file(video_data, prompt, task_id, user_id)
-
-                    video_size_mb = len(video_data) / (1024 * 1024)
-
-                    if saved_video_id:
-                        await self.emit_status(
-                            __event_emitter__, "info", "RunwayML video generation complete!", True
-                        )
-                        # Build full content URL and return a simple markdown link (known working pattern)
-                        webui_base = os.getenv("WEBUI_URL", "http://localhost:8080").rstrip("/")
-                        content_url = f"{webui_base}/api/v1/files/{saved_video_id}/content"
-
-                        response_content = (
-                            f"✅ RunwayML video generated! [Click here to download]({content_url}) "
-                            f"({video_size_mb:.1f}MB)"
-                        )
-
-                        # Also append to messages for history, but primary return is the string content
-                        body["messages"].append({
-                            "role": "assistant",
-                            "content": response_content,
-                        })
-
-                        self.log.info(f"Video processed: {video_size_mb:.1f}MB, saved with ID: {saved_video_id}")
-                        return response_content
-                    else:
-                        response_content = (
-                            f"✅ RunwayML video generated but failed to save. Size: {video_size_mb:.1f}MB"
-                        )
-                        body["messages"].append({"role": "assistant", "content": response_content})
-                        return response_content
-                else:
-                    response_content = "❌ Error: Failed to download generated video."
-                    body["messages"].append({"role": "assistant", "content": response_content})
-                    return response_content
-            else:
-                response_content = "❌ Error: Video generation failed or timed out. Please try again."
-                body["messages"].append({"role": "assistant", "content": response_content})
-                self.log.error("Video generation failed - no URL returned")
-                return response_content
-
-        except Exception as e:
-            error_msg = f"❌ Error: Error during video generation: {str(e)}"
-            self.log.exception(error_msg)
-            await self.emit_status(__event_emitter__, "error", error_msg, True)
-            body["messages"].append({"role": "assistant", "content": f"❌ Error: {str(e)}"})
-            return f"❌ Error: {str(e)}"
-
-    def _extract_latest_user_prompt(self, messages: list[dict]) -> str:
-        """Return the latest user-authored text prompt that passes guard checks."""
-        for msg in reversed(messages or []):
-            if (msg or {}).get("role") != "user":
-                continue
-            content = (msg or {}).get("content", "")
-            text = ""
-            if isinstance(content, str):
-                text = content
-            elif isinstance(content, list):
-                parts = []
-                for item in content:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("type") == "text" and isinstance(item.get("text"), str):
-                        parts.append(item["text"])
-                    elif isinstance(item.get("content"), str):
-                        parts.append(item["content"])  # tolerate other shapes
-                text = "\n".join(p for p in parts if p)
-            elif isinstance(content, dict):
-                text = content.get("text") or content.get("content") or json.dumps(content)
-
-            text = (text or "").strip()
-            if not text:
-                continue
-            if self._is_guarded_prompt(text):
-                self.log.info("Guard skipped a suspicious user prompt candidate.")
-                continue
-            return text
-        return ""
-
-    def _is_guarded_prompt(self, text: str) -> bool:
-        """Heuristics to avoid meta/suggestion/system-like text as a generation prompt."""
-        lower = (text or "").strip().lower()
-        if lower.startswith("task:"):
-            return True
-        if lower.startswith("### task"):
-            return True
-        if "suggest" in lower and "follow-up" in lower:
-            return True
-        if re.search(r"\bsuggest\s+\d+\s*-?\s*\d*\s*", lower) and ("question" in lower or "prompt" in lower):
-            return True
-        if len(lower.split()) <= 1 and len(lower) < 4:
-            return True
-        return False
-
-    # Include all the helper methods from the original pipeline
-    async def _start_video_generation(self, prompt: str, image_url: str, api_key: str, 
-                                    model: str, duration: int, ratio: str, api_base_url: str) -> Optional[str]:
-        """Start the video generation process and return the task ID."""
-        url = f"{api_base_url}/image_to_video"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "X-Runway-Version": "2024-11-06",
-        }
-        data = {
-            "promptImage": image_url,
-            "promptText": prompt,
-            "model": model,
-            "duration": duration,
-            "ratio": ratio,
-            "seed": 4294967295,
-            "contentModeration": {"publicFigureThreshold": "auto"},
-        }
-
+    async def _ask(self, caller, event):
+        if caller is None:
+            raise UserCancelled("Interactive options/confirmation need a connected Open WebUI chat. No generation was started.")
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=data) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        task_id = result.get("id")
-                        self.log.info(f"Video generation started with task ID: {task_id}")
-                        return task_id
-                    else:
-                        error_text = await response.text()
-                        self.log.error(f"Failed to start generation: {response.status} - {error_text}")
-                        return None
-        except Exception as e:
-            self.log.error(f"Error starting video generation: {str(e)}")
-            return None
-
-    async def _poll_video_status(self, task_id: str, api_key: str, api_base_url: str, event_emitter: Optional[Callable[[dict], Awaitable[None]]] = None) -> Optional[str]:
-        """Poll for video generation completion."""
-        url = f"{api_base_url}/tasks/{task_id}"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-Runway-Version": "2024-11-06",
-        }
-
-        start_time = time.time()
-        
-        # Progressive status update intervals from valve configuration
-        try:
-            status_intervals = [int(x.strip()) for x in self.valves.PROGRESS_UPDATE_INTERVALS.split(',')]
+            result = await asyncio.wait_for(caller(event), timeout=self.valves.EVENT_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise UserCancelled("The dialog timed out. No generation was started.") from None
         except Exception:
-            status_intervals = [15, 30, 60, 120]  # Fallback to default
-        next_status_index = 0
-        
-        async with aiohttp.ClientSession() as session:
-            while time.time() - start_time < self.valves.MAX_POLL_TIME:
-                elapsed = int(time.time() - start_time)
-                
-                # Show progress at progressive intervals
-                if next_status_index < len(status_intervals):
-                    if elapsed >= status_intervals[next_status_index]:
-                        await self.emit_status(
-                            event_emitter, "info", f"Still generating video... ({elapsed}s elapsed)"
-                        )
-                        next_status_index += 1
-                elif elapsed % 120 == 0 and elapsed > 0:
-                    # After 120s, update every 2 minutes
-                    await self.emit_status(
-                        event_emitter, "info", f"Still generating video... ({elapsed}s elapsed)"
-                    )
-                
-                try:
-                    async with session.get(url, headers=headers) as response:
-                        if response.status == 200:
-                            result = await response.json()
-                            status = result.get("status", "")
-                            
-                            if status == "SUCCEEDED":
-                                video_url = result.get("output", [])
-                                if video_url and len(video_url) > 0:
-                                    video_url = video_url[0]
-                                    self.log.info(f"Video generation completed: {video_url}")
-                                    return video_url
-                                else:
-                                    self.log.error("No video URL in successful response")
-                                    return None
-                            elif status == "FAILED":
-                                error_msg = result.get("failure", {}).get("reason", "Unknown error")
-                                self.log.error(f"Generation failed: {error_msg}")
-                                return None
-                            elif status in ["PENDING", "RUNNING"]:
-                                self.log.debug(f"Still processing... Status: {status}")
-                        else:
-                            self.log.error(f"Status check failed: {response.status}")
-                except Exception as e:
-                    self.log.error(f"Poll error: {str(e)}")
+            raise UserCancelled("The dialog could not reach your browser. No generation was started.") from None
+        if result is False or result is None or isinstance(result, dict):
+            raise UserCancelled("The dialog was cancelled or disconnected. No generation was started.")
+        return result
 
-                await asyncio.sleep(self.valves.POLL_INTERVAL)
+    async def _choose(self, caller, title, choices, current):
+        values = [v for v, label in choices]
+        result = await self._ask(caller, {"type": "input", "data": {
+            "title": title, "message": "Choose a setting for this generation.",
+            "input": {"type": "select", "options": [{"value": v, "label": label} for v, label in choices]},
+            "value": current if current in values else values[0],
+        }})
+        if not isinstance(result, str) or result not in values:
+            raise UserCancelled("No valid option was selected. No generation was started.")
+        return result
 
-        self.log.error(f"Video generation timed out after {self.valves.MAX_POLL_TIME} seconds")
-        return None
+    async def _choose_options(self, caller, options, has_image):
+        options = dict(options)
+        options["model"] = await self._choose(caller, "Video model", [
+            (m, label) for m, label in MODELS.items() if has_image or m != "gen4_turbo"
+        ], options["model"])
+        selected = await self._choose(caller, "Video format", [
+            (f"{res}|{shape}", f"{shape} · {res} ({px})")
+            for res, ratios in self._formats(options["model"], has_image).items() for shape, px in ratios.items()
+        ], f"{options['resolution']}|{options['aspect_ratio']}")
+        options["resolution"], options["aspect_ratio"] = selected.split("|")
+        lo, hi = (4, 30) if options["model"] == "seedance2_5" else (2, 10)
+        options["duration"] = int(await self._choose(caller, "Video duration", [
+            (str(i), f"{i} seconds") for i in range(lo, hi + 1)
+        ], str(options["duration"])))
+        if options["model"] == "seedance2_5":
+            options["audio"] = await self._choose(caller, "Generated audio", [
+                ("yes", "Include audio"), ("no", "Silent video")
+            ], "yes" if options["audio"] else "no") == "yes"
+        else:
+            options["audio"] = False
+        return options
 
-    async def _download_video(self, video_url: str, api_key: str) -> Optional[bytes]:
-        """Download the video from RunwayML."""
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-Runway-Version": "2024-11-06",
-        }
+    @staticmethod
+    def _input(body, files):
+        message = next((m for m in reversed(body.get("messages", [])) if m.get("role") == "user"), {})
+        content = message.get("content", "")
+        text, refs = [], []
+        if isinstance(content, str):
+            text.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if part.get("type") == "text":
+                    text.append(part.get("text", ""))
+                elif part.get("type") in ("image_url", "input_image"):
+                    ref = part.get("image_url") or part.get("url")
+                    refs.append(ref.get("url") if isinstance(ref, dict) else ref)
+        for item in files or []:
+            if not isinstance(item, dict):
+                continue
+            nested = item.get("file") or {}
+            meta = nested.get("meta") or item.get("meta") or {}
+            mime = item.get("content_type") or item.get("mime_type") or item.get("mime") or meta.get("content_type") or ""
+            if item.get("type") == "image" or mime.startswith("image/"):
+                fid = item.get("id") or nested.get("id")
+                refs.append(f"/api/v1/files/{fid}/content" if fid else item.get("url") or nested.get("url"))
+            elif item.get("type") == "file" or mime:
+                raise ValueError("Attach a PNG, JPEG or WebP image for image-to-video. Other attachment types are not supported.")
+        refs.extend(message.get("images") or [])
+        prompt = "\n".join(text).strip()
+        def extract(match):
+            refs.append(match.group(1))
+            return ""
+        prompt = re.sub(r"!\[[^\]]*\]\(([^\s)]+)\)", extract, prompt)
+        prompt = re.sub(r"(?:https?://[^\s/]+)?(/(?:[^\s/]+/)*api/v1/files/[a-fA-F0-9-]+/content)(?:\?[^\s]*)?", extract, prompt)
+        unique = {}
+        for ref in refs:
+            if not isinstance(ref, str) or not ref:
+                raise ValueError("An attached image could not be read. Attach it again.")
+            match = re.search(r"/api/v1/files/([a-fA-F0-9-]+)/content", ref)
+            unique[match.group(1) if match else ref] = ref
+        if len(unique) > 1:
+            raise ValueError("Attach one first-frame image per generation. Multiple-image references are not supported by this Pipe.")
+        return prompt.strip(), next(iter(unique.values()), None)
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(video_url, headers=headers) as response:
-                    if response.status == 200:
-                        video_data = await response.read()
-                        self.log.info(f"Video downloaded successfully, size: {len(video_data)} bytes")
-                        return video_data
-                    else:
-                        self.log.error(f"Failed to download video: {response.status}")
-                        return None
-        except Exception as e:
-            self.log.error(f"Error downloading video: {str(e)}")
+    def _inline_options(self, prompt, options, has_image):
+        """Retain the previous Pipe's explicit trailing JSON / runway-tag overrides."""
+        match = re.search(r"\s*(\{[^{}]*\}|<runway\s+[^>]+/?>)\s*$", prompt, re.IGNORECASE)
+        if not match:
+            return prompt, options
+        block = match.group(1)
+        if block.startswith("{"):
+            try:
+                overrides = json.loads(block)
+            except ValueError:
+                return prompt, options
+            if not set(overrides).intersection({"model", "duration", "ratio", "audio"}):
+                return prompt, options
+            if set(overrides) - {"model", "duration", "ratio", "audio"}:
+                raise ValueError("Inline options support only model, duration, ratio and audio.")
+        else:
+            overrides = dict(re.findall(r'(model|duration|ratio|audio)\s*=\s*"([^"]*)"', block))
+            if "duration" in overrides:
+                if not overrides["duration"].isdigit():
+                    raise ValueError("Inline duration must be a whole number.")
+                overrides["duration"] = int(overrides["duration"])
+            if "audio" in overrides:
+                if overrides["audio"] not in ("true", "false"):
+                    raise ValueError("Inline audio must be true or false.")
+                overrides["audio"] = overrides["audio"] == "true"
+        result = {**options, **{k: v for k, v in overrides.items() if k != "ratio"}}
+        if result["model"] not in MODELS or not isinstance(result["audio"], bool):
+            raise ValueError("Invalid inline model or audio option.")
+        if "ratio" in overrides:
+            ratio = overrides["ratio"]
+            if ratio in SHAPES:
+                result["aspect_ratio"] = ratio
+            else:
+                found = [(res, shape) for res, shapes in self._formats(result["model"], has_image).items() for shape, px in shapes.items() if px == ratio]
+                if not found:
+                    raise ValueError("Unsupported inline pixel ratio for this model/mode.")
+                result["resolution"], result["aspect_ratio"] = found[0]
+        if result["model"] != "seedance2_5":
+            result["audio"] = False
+        return prompt[:match.start()].strip(), result
+
+    def _check_image(self, data, mime):
+        if mime not in IMAGE_MIMES:
+            raise ValueError("Use PNG, JPEG or WebP; GIF and SVG are not supported.")
+        if not data or len(data) > self.valves.MAX_INPUT_MB * 1024 * 1024:
+            raise ValueError(f"The image must be non-empty and at most {self.valves.MAX_INPUT_MB} MB.")
+        return data, mime
+
+    async def _read_image(self, ref, user):
+        if not ref:
             return None
-
-    async def _save_video_file(self, video_data: bytes, prompt: str, task_id: str, user_id: str = None) -> Optional[str]:
-        """Save video data using Open WebUI's file system."""
-        try:
-            from open_webui.models.files import Files, FileForm
+        match = re.search(r"/api/v1/files/([a-fA-F0-9-]+)/content(?:[?#]|$)", ref)
+        if match:
+            from open_webui.models.files import Files
             from open_webui.storage.provider import Storage
-            
-            # Create safe filename
-            safe_prompt = "".join(c for c in prompt[:30] if c.isalnum() or c in (" ", "-", "_")).rstrip()
-            safe_prompt = safe_prompt.replace(" ", "_")
-            timestamp = int(time.time())
-            filename = f"runway_inline_{safe_prompt}_{timestamp}.mp4"
-            
-            # Create temporary file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
-                temp_file.write(video_data)
-                temp_file_path = temp_file.name
-            
+            from open_webui.utils.access_control.files import has_access_to_file
+            item = await Files.get_file_by_id(match.group(1))
+            if not item or not (item.user_id == user.id or user.role == "admin" or await has_access_to_file(item.id, "read", user)):
+                raise ValueError("The attached image is unavailable or you do not have access to it.")
+            mime = (item.meta or {}).get("content_type") or mimetypes.guess_type(item.filename)[0]
+            path = await asyncio.to_thread(Storage.get_file, item.path)
+            def read():
+                with open(path, "rb") as f:
+                    return f.read(self.valves.MAX_INPUT_MB * 1024 * 1024 + 1)
+            return self._check_image(await asyncio.to_thread(read), mime)
+        if ref.startswith("data:"):
+            if len(ref) > (self.valves.MAX_INPUT_MB * 1024 * 1024 * 4 // 3) + 100:
+                raise ValueError("The encoded image exceeds the configured size limit.")
+            match = re.fullmatch(r"data:(image/[\w.+-]+);base64,(.+)", ref, re.DOTALL)
+            if not match:
+                raise ValueError("The image data URI is invalid.")
             try:
-                # Upload using Open WebUI's storage system
-                with open(temp_file_path, "rb") as f:
-                    file_data, file_path = Storage.upload_file(
-                        f, filename, {"content_type": "video/mp4", "source": "runway_inline_pipeline"}
-                    )
-                
-                # Create database record
-                file_id = str(uuid.uuid4())
-                file_record = Files.insert_new_file(
-                    user_id or "system",
-                    FileForm(
-                        id=file_id,
-                        filename=filename,
-                        path=file_path,
-                        meta={
-                            "name": filename,
-                            "content_type": "video/mp4",
-                            "size": len(video_data),
-                            "source": "runway_inline_pipeline",
-                            "prompt": prompt[:100],
-                            "task_id": task_id
-                        }
-                    )
-                )
-                
-                if file_record:
-                    self.log.info(f"Video saved with file ID: {file_record.id}")
-                    return file_record.id
-                else:
-                    self.log.error("Failed to create file database record")
-                    return None
-                    
-            finally:
-                if os.path.exists(temp_file_path):
-                    os.unlink(temp_file_path)
-
-        except ImportError as e:
-            self.log.error(f"Failed to import Open WebUI components: {str(e)}")
-            return None
-
-    def _parse_inline_overrides(self, prompt_text: str) -> tuple[str, dict]:
-        """Extract inline parameter overrides from prompt."""
-        overrides: dict = {}
-        cleaned = prompt_text or ""
-        
+                data = base64.b64decode(match.group(2), validate=True)
+            except ValueError:
+                raise ValueError("The image contains invalid base64 data.") from None
+            return self._check_image(data, match.group(1))
+        if ref.startswith("runway://") and 13 <= len(ref) <= 5000:
+            return ref
+        parts = urlsplit(ref)
+        if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or len(ref) > 2048:
+            raise ValueError("Image references must be OWUI files, data URIs, Runway uploads or public HTTPS URLs.")
         try:
-            # Try JSON object
-            json_match = re.findall(r"\{[^{}]*\}", cleaned, flags=re.DOTALL)
-            if json_match:
-                candidate = json_match[-1]
-                try:
-                    data = json.loads(candidate)
-                    if isinstance(data, dict):
-                        for k in ("duration", "ratio", "model"):
-                            if k in data:
-                                overrides[k] = data[k]
-                        if overrides:
-                            cleaned = cleaned.replace(candidate, "", 1).strip()
-                            return cleaned, overrides
-                except Exception:
-                    pass
-
-            # Try XML-ish tag
-            tag = re.search(r"<runway\s+([^>]*)/?>", cleaned, flags=re.IGNORECASE)
-            if tag:
-                attrs = tag.group(1)
-                for key in ("duration", "ratio", "model"):
-                    m = re.search(fr"{key}\s*=\s*\"([^\"]+)\"", attrs, flags=re.IGNORECASE)
-                    if m:
-                        overrides[key] = m.group(1)
-                if overrides:
-                    cleaned = cleaned.replace(tag.group(0), "").strip()
-        except Exception:
+            ipaddress.ip_address(parts.hostname)
+        except ValueError:
             pass
-            
-        return cleaned, overrides
+        else:
+            raise ValueError("Runway image URLs must use a domain name, not an IP address.")
+        return ref  # Runway fetches this; do not download arbitrary URLs on the OWUI server.
 
-    def _normalize_params(self, inline_overrides: dict) -> dict:
-        """Normalize parameters from valves and inline overrides."""
-        # Model
-        model = (inline_overrides.get("model") or self.valves.MODEL).strip() if isinstance(inline_overrides.get("model"), str) else self.valves.MODEL
-        allowed_models = {"gen4_turbo", "gen4"}
-        if model not in allowed_models:
-            model = self.valves.MODEL
-
-        # Duration
+    async def _api(self, client, method, path, payload=None):
+        # Never retry generation POSTs: a lost response may still have created a paid task.
         try:
-            dur_val = inline_overrides.get("duration", self.valves.DURATION)
-            duration = int(dur_val)
+            response = await client.request(method, path, json=payload)
+        except httpx.HTTPError:
+            if method == "POST" and path in ("text_to_video", "image_to_video"):
+                raise RunwayError("The submission response was lost. A task may have been created; check Runway before retrying.") from None
+            raise RunwayError("Runway could not be reached.", status=503) from None
+        if response.is_error or response.is_redirect:
+            guidance = {400: "Runway rejected these inputs or settings.", 401: "Check RUNWAY_API_KEY.",
+                        403: "Check your Runway API access and model permissions.", 404: "The Runway resource was not found.",
+                        429: "Runway's rate or credit limit was reached."}.get(response.status_code, "Runway could not complete the request.")
+            try:
+                delay = max(5, min(60, float(response.headers.get("Retry-After", "5"))))
+            except ValueError:
+                delay = 5
+            raise RunwayError(f"{guidance} (HTTP {response.status_code})", response.status_code, delay)
+        if method == "DELETE":
+            return {}
+        try:
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError()
+            return data
+        except ValueError:
+            raise RunwayError("Runway returned an invalid response. Check the task in Runway before retrying.") from None
+
+    async def _prepare_image(self, image, api):
+        if image is None or isinstance(image, str):
+            return image
+        data, mime = image
+        uri = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        if len(uri) <= 5 * 1024 * 1024:
+            return uri
+        upload = await self._api(api, "POST", "uploads", {"filename": "frame" + IMAGE_MIMES[mime], "type": "ephemeral"})
+        if urlsplit(upload.get("uploadUrl", "")).scheme != "https" or not str(upload.get("runwayUri", "")).startswith("runway://"):
+            raise RunwayError("Runway returned an invalid upload location.")
+        # The signed storage upload must not receive the Runway bearer token.
+        async with httpx.AsyncClient(timeout=self.valves.DOWNLOAD_TIMEOUT) as media:
+            response = await media.post(upload["uploadUrl"], data=upload["fields"], files={"file": ("frame" + IMAGE_MIMES[mime], data, mime)})
+            if not response.is_success:
+                raise RunwayError("The temporary image upload failed. No generation was started.")
+        return upload["runwayUri"]
+
+    async def _poll(self, api, task_id, emitter):
+        deadline = time.monotonic() + self.valves.MAX_POLL_TIME
+        last_status = None
+        while time.monotonic() < deadline:
+            delay = self.valves.POLL_INTERVAL
+            try:
+                task = await self._api(api, "GET", f"tasks/{task_id}")
+                status = task.get("status")
+                if status == "SUCCEEDED":
+                    if not isinstance(task.get("output"), list) or not task["output"]:
+                        raise RunwayError("Runway finished without any video outputs.")
+                    return task
+                if status == "FAILED":
+                    code = re.sub(r"[^A-Za-z0-9_.-]", "", str(task.get("failureCode", "unknown")))[:100]
+                    raise RunwayError(f"Runway generation failed ({code}). Check this task in Runway for details.")
+                if status == "CANCELLED":
+                    raise RunwayError("Runway cancelled the generation.")
+                if status not in ("PENDING", "THROTTLED", "RUNNING"):
+                    raise RunwayError("Runway returned an unexpected task status.")
+                if status != last_status:
+                    await self._status(emitter, f"Runway: {status.lower()} · task {task_id}")
+                    last_status = status
+            except RunwayError as error:
+                if error.status != 429 and not (error.status and error.status >= 500):
+                    raise
+                delay = max(delay, error.retry_after)
+            await asyncio.sleep(min(delay, max(0, deadline - time.monotonic())))
+        raise RunwayError("The wait limit was reached. The task may still finish in Runway; check it before generating again.")
+
+    async def _download(self, uri):
+        if not isinstance(uri, str) or urlsplit(uri).scheme != "https":
+            raise RunwayError("Runway returned an invalid video URL.")
+        limit = self.valves.MAX_VIDEO_MB * 1024 * 1024
+        # A separate unauthenticated client keeps API credentials away from the CDN.
+        async with httpx.AsyncClient(timeout=self.valves.DOWNLOAD_TIMEOUT, follow_redirects=True) as media:
+            async with media.stream("GET", uri) as response:
+                response.raise_for_status()
+                mime = response.headers.get("Content-Type", "").split(";", 1)[0]
+                if mime not in ("video/mp4", "application/octet-stream"):
+                    raise RunwayError("The output is not an MP4 video.")
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(data) + len(chunk) > limit:
+                        raise RunwayError("The video exceeds MAX_VIDEO_MB.")
+                    data.extend(chunk)
+                if len(data) < 12 or data[4:8] != b"ftyp":
+                    raise RunwayError("The output does not contain an MP4 file header.")
+                return bytes(data)
+
+    async def _save(self, data, request, user, metadata, options, task_id, index):
+        from fastapi import UploadFile
+        from starlette.datastructures import Headers
+        from open_webui.routers.files import upload_file_handler
+        from open_webui.models.chats import Chats
+        filename = f"runway_{options['model']}_{task_id}_{index}.mp4"
+        upload = UploadFile(file=io.BytesIO(data), filename=filename, headers=Headers({"content-type": "video/mp4"}))
+        try:
+            record = await upload_file_handler(request, file=upload, user=user, process=False, metadata={
+                "source": "runway_inline", "task_id": task_id, "generation_options": options,
+                "result_index": index, "chat_id": metadata.get("chat_id"), "message_id": metadata.get("message_id"),
+            })
+        finally:
+            await upload.close()
+        if not record or not record.id:
+            raise RunwayError("The Files API did not return a saved file.")
+        chat, message = metadata.get("chat_id"), metadata.get("message_id")
+        if chat and message and not str(chat).startswith(("local:", "temporary:", "channel:")):
+            try:
+                await Chats.insert_chat_files(chat_id=chat, message_id=message, file_ids=[record.id], user_id=user.id)
+            except Exception:
+                self.log.warning("Saved video could not be linked to the chat")
+        root = request.scope.get("root_path", "").rstrip("/")
+        url = root + str(request.app.url_path_for("get_file_content_by_id", id=record.id))
+        return url, record.filename
+
+    async def _deliver(self, task, request, user, metadata, options, emitter):
+        saved, links, failures = [], [], []
+        for index, uri in enumerate(task["output"], 1):
+            await self._status(emitter, f"Saving video {index} of {len(task['output'])}...")
+            try:
+                data = await self._download(uri)
+                url, filename = await self._save(data, request, user, metadata, options, task["id"], index)
+                saved.append(self._video_embed_html(url, filename))
+                links.append(f"[Download video {index}]({url}?attachment=true)")
+            except Exception:
+                self.log.warning("Could not save Runway task %s output %s", task["id"], index)
+                failures.append(f"Video {index} could not be saved; check storage limits and retrieve it from Runway before its output URL expires.")
+        if saved and emitter:
+            try:
+                await emitter({"type": "embeds", "data": {"embeds": saved}})
+            except Exception:
+                failures.append("Inline players could not be delivered. Use the saved download links.")
+        await self._status(emitter, f"{len(saved)} video(s) saved" if saved else "No videos could be saved", True)
+        return "\n\n".join([f"{len(saved)} video(s) saved.", *links, *failures, f"Runway task: `{task['id']}`"])
+
+    async def pipe(self, body: dict, __user__: Optional[dict] = None, __request__: Any = None,
+                   __event_emitter__: Any = None, __event_call__: Any = None,
+                   __files__: Optional[list] = None, __metadata__: Optional[dict] = None,
+                   __task__: Optional[str] = None) -> str:
+        metadata = {**(body.get("metadata") or {}), **(__metadata__ or {})}
+        if __task__ or metadata.get("task"):
+            return ""
+        task_id = None
+        try:
+            from open_webui.models.users import Users
+            uid = (__user__ or {}).get("id")
+            user = await Users.get_user_by_id(uid) if uid else None
+            if user is None or __request__ is None:
+                raise ValueError("An authenticated Open WebUI user and request are required.")
+            options, ask_options = self._options(__user__)
+            prompt, ref = self._input(body, __files__ if __files__ is not None else metadata.get("files", body.get("files", [])))
+            image = await self._read_image(ref, user)
+            prompt, options = self._inline_options(prompt, options, image is not None)
+            if ask_options:
+                options = await self._choose_options(__event_call__, options, image is not None)
+            endpoint, _ = self._payload(prompt, "pending-image" if image is not None else None, options)
+            key = EncryptedStr.decrypt(str(self.valves.RUNWAY_API_KEY)) or os.getenv("RUNWAYML_API_SECRET", "")
+            if not key:
+                raise ValueError("Set RUNWAY_API_KEY or RUNWAYML_API_SECRET to a Runway developer API key.")
+            base = self.valves.API_BASE_URL.rstrip("/") + "/"
+            parts = urlsplit(base)
+            if parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+                raise ValueError("API_BASE_URL must be a valid HTTPS API base URL.")
+            if self.valves.REQUIRE_CONFIRMATION:
+                audio = ("audio on" if options["audio"] else "silent") if options["model"] == "seedance2_5" else "silent"
+                answer = await self._ask(__event_call__, {"type": "confirmation", "data": {
+                    "title": "Generate this video with Runway?",
+                    "message": f"{MODELS[options['model']]} · {options['duration']} seconds · {options['aspect_ratio']} · {options['resolution']} · {audio}. "
+                    + ("Use the attached image as the first frame. " if image is not None else "Text-to-video. ")
+                    + "Your prompt and selected image will be sent to Runway. This generation uses Runway credits.\n\n"
+                    + (prompt[:600] + ("…" if len(prompt) > 600 else "") or "Animate the attached image."),
+                }})
+                if answer is not True:
+                    raise UserCancelled("Generation was not confirmed. No task was started.")
+            async with httpx.AsyncClient(base_url=base, timeout=60, headers={
+                "Authorization": f"Bearer {key}", "X-Runway-Version": "2024-11-06",
+            }) as api:
+                await self._status(__event_emitter__, "Preparing the Runway request...")
+                prepared = await self._prepare_image(image, api)
+                endpoint, payload = self._payload(prompt, prepared, options)
+                submitted = await self._api(api, "POST", endpoint, payload)
+                try:
+                    task_id = str(UUID(submitted["id"]))
+                except (KeyError, ValueError, TypeError, AttributeError):
+                    raise RunwayError("Runway did not return a valid task ID. Check Runway before retrying.") from None
+                await self._status(__event_emitter__, f"Runway task submitted: {task_id}")
+                try:
+                    task = await self._poll(api, task_id, __event_emitter__)
+                except asyncio.CancelledError:
+                    try:
+                        await asyncio.wait_for(self._api(api, "DELETE", f"tasks/{task_id}"), timeout=10)
+                    except Exception:
+                        self.log.warning("Could not cancel Runway task %s", task_id)
+                    raise
+                task["id"] = task_id
+                return await self._deliver(task, __request__, user, metadata, options, __event_emitter__)
+        except (UserCancelled, ValueError, RunwayError) as error:
+            await self._status(__event_emitter__, "Runway request stopped", True)
+            return str(error) + (f"\n\nRunway task: `{task_id}`" if task_id else "")
         except Exception:
-            duration = int(self.valves.DURATION)
-        duration = max(1, min(10, duration))
-        if model == "gen4_turbo":
-            duration = 5 if duration <= 7 else 10
+            self.log.warning("Runway request failed%s", f" for task {task_id}" if task_id else "")
+            await self._status(__event_emitter__, "Runway request failed", True)
+            return "The Runway request could not be completed. Check the server configuration and Runway task status before retrying." + (f"\n\nRunway task: `{task_id}`" if task_id else "")
 
-        # Ratio
-        ratio_input = inline_overrides.get("ratio", self.valves.RATIO)
-        ratio_str = str(ratio_input or "").strip().lower()
-        
-        alias_map = {"square": "1:1", "portrait": "9:16", "landscape": "16:9"}
-        ratio = alias_map.get(ratio_str, ratio_str)
-        ratio = re.sub(r"\s*:\s*", ":", ratio) if ratio else ratio
-
-        # Validate ratio for model
-        allowed_ratios_turbo = {"1280:720", "720:1280", "1104:832", "832:1104", "960:960", "1584:672"}
-        allowed_ratios_all = allowed_ratios_turbo | {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "768:1280", "1280:768"}
-        allowed_ratios = allowed_ratios_turbo if model == "gen4_turbo" else allowed_ratios_all
-
-        if ratio not in allowed_ratios:
-            if model == "gen4_turbo" and ratio in {"16:9", "9:16", "1:1"}:
-                ratio = {"16:9": "1280:720", "9:16": "720:1280", "1:1": "960:960"}[ratio]
-            else:
-                ratio = self.valves.RATIO
-
-        api_base_url = (self.valves.API_BASE_URL or "").rstrip("/")
-
-        return {"model": model, "duration": duration, "ratio": ratio, "api_base_url": api_base_url}
-
-    def _resolve_prompt_image(self, image_ref: str) -> Optional[str]:
-        """Resolve image reference to form acceptable by Runway."""
-        try:
-            if not image_ref or not isinstance(image_ref, str):
-                return None
-
-            # Already a data URI
-            if image_ref.startswith("data:"):
-                return image_ref
-
-            # Try to resolve Open WebUI file ID
-            m = re.search(r"/api/v1/files/([a-f0-9\-]+)/content", image_ref, re.IGNORECASE)
-            if m:
-                file_id = m.group(1)
-                file_model = FilesDB.get_file_by_id(file_id)
-                if file_model and file_model.path:
-                    local_path = Storage.get_file(file_model.path)
-                    with open(local_path, "rb") as f:
-                        data_bytes = f.read()
-                    mime_type = None
-                    if file_model.meta and isinstance(file_model.meta, dict):
-                        mime_type = file_model.meta.get("content_type") or file_model.meta.get("mime_type")
-                    if not mime_type:
-                        mime_type = mimetypes.guess_type(file_model.filename or local_path)[0] or "image/png"
-                    b64 = base64.b64encode(data_bytes).decode("utf-8")
-                    return f"data:{mime_type};base64,{b64}"
-
-            # Accept direct http(s) URL
-            if image_ref.startswith("http://") or image_ref.startswith("https://"):
-                return image_ref
-
-            return None
-        except Exception as e:
-            self.log.error(f"Failed to resolve prompt image: {e}")
-            return None
-
-    def _extract_images_from_content(self, content: str) -> list[str]:
-        """Extract image URLs from markdown or HTML content."""
-        urls: list[str] = []
-        try:
-            # Markdown images
-            md = re.findall(r'!\[.*?\]\((data:image/[^)]+|https?://[^)]+|/[^)]+)\)', content)
-            urls.extend(md)
-
-            # HTML <img src>
-            html = re.findall(r'<img[^>]+src=["\']([^"\']+)["\']', content, flags=re.IGNORECASE)
-            urls.extend(html)
-
-            # Bare Open WebUI file API paths
-            file_api = re.findall(r'(?:https?://[^\s)]+)?(/api/v1/files/[a-f0-9\-]+/content)', content, flags=re.IGNORECASE)
-            for m in file_api:
-                urls.append(m if m.startswith('/') else f'/{m.lstrip("/")}')
-
-            # Bare absolute image URLs
-            abs_img = re.findall(r'https?://[^\s)]+\.(?:png|jpg|jpeg|webp|gif)(?:\?[^\s)]*)?', content, flags=re.IGNORECASE)
-            urls.extend(abs_img)
-
-            # Deduplicate
-            seen = set()
-            deduped = []
-            for u in urls:
-                if u not in seen:
-                    seen.add(u)
-                    deduped.append(u)
-            return deduped
-        except Exception:
-            return urls
+    @staticmethod
+    def _video_embed_html(content_url: str, filename: str) -> str:
+        # Keep only a durable file URL in chat history, never video bytes or credentials.
+        # Attribute escaping also prevents a filename/URL from injecting executable HTML.
+        return '''<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { margin: 0; font: 14px system-ui, sans-serif; color: #666; }
+video { display: block; width: 100%; max-height: 560px; background: #000; border-radius: 12px; }
+video[hidden] { display: none; }
+#status { margin: 8px 0; }
+</style></head><body>
+<video id="video" controls playsinline preload="metadata" hidden></video>
+<p id="status" role="status">Loading video…</p>
+<a id="download" href="__CONTENT_URL__?attachment=true" data-content-url="__CONTENT_URL__"
+   download="__FILENAME__" target="_blank" rel="noopener">Download video</a>
+<noscript>Enable iframe scripts to play the video, or use the download link below the player.</noscript>
+<script>
+(() => {
+  const video = document.getElementById('video');
+  const status = document.getElementById('status');
+  const download = document.getElementById('download');
+  let objectUrl;
+  const controller = new AbortController();
+  const reportHeight = () => parent.postMessage({
+    type: 'iframe:height', height: document.documentElement.scrollHeight
+  }, '*');
+  new ResizeObserver(reportHeight).observe(document.body);
+  window.addEventListener('load', reportHeight);
+  window.addEventListener('pagehide', () => {
+    controller.abort();
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+  }, { once: true });
+  video.addEventListener('error', () => {
+    status.textContent = 'This browser could not play the video. Use the download link.';
+    reportHeight();
+  });
+  async function loadVideo() {
+    try {
+      // A srcdoc iframe with the default sandbox has an opaque origin.
+      // Do not try reading the parent's token or changing its settings.
+      if (window.origin === 'null') {
+        status.textContent = 'To play this saved video, enable Settings → Interface → iframe Sandbox Allow Same Origin, then reopen the chat. You can also use the download link below this player.';
+        return;
+      }
+      const url = new URL(download.dataset.contentUrl, document.baseURI);
+      if (url.origin !== window.location.origin && url.origin !== window.origin) {
+        throw new Error('The video must be served by this Open WebUI instance.');
+      }
+      const response = await fetch(url.href, {
+        credentials: 'same-origin', signal: controller.signal
+      });
+      if (response.status === 401 || response.status === 403) {
+        throw new Error('Sign in to Open WebUI with an account that can access this video.');
+      }
+      if (!response.ok) throw new Error('The saved video is unavailable (HTTP ' + response.status + ').');
+      const blob = await response.blob();
+      if (!blob.type.startsWith('video/')) throw new Error('The file response is not a video.');
+      objectUrl = URL.createObjectURL(blob);
+      video.src = objectUrl;
+      video.hidden = false;
+      download.href = objectUrl;
+      status.textContent = '';
+    } catch (error) {
+      if (error.name !== 'AbortError') status.textContent = error.message + ' Use the download link below the player.';
+    } finally { reportHeight(); }
+  }
+  loadVideo();
+})();
+</script></body></html>'''.replace('__CONTENT_URL__', escape(content_url, quote=True)).replace('__FILENAME__', escape(filename, quote=True))
