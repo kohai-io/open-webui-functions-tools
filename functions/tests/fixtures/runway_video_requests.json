@@ -1,0 +1,708 @@
+{
+  "source": "https://docs.dev.runwayml.com/api/",
+  "retrieved": "2026-09-11",
+  "version": "2024-11-06",
+  "schemas": {
+    "image_to_video": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "promptText": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            },
+            "promptImage": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 2048,
+                      "pattern": "^https:\\/\\/.*"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 5000,
+                      "pattern": "^runway:\\/\\/.*"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 5242880,
+                      "pattern": "^data:image\\/.*"
+                    }
+                  ]
+                },
+                {
+                  "minItems": 1,
+                  "maxItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "uri": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 2048,
+                            "pattern": "^https:\\/\\/.*"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 5000,
+                            "pattern": "^runway:\\/\\/.*"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 5242880,
+                            "pattern": "^data:image\\/.*"
+                          }
+                        ]
+                      },
+                      "position": {
+                        "type": "string",
+                        "const": "first"
+                      }
+                    },
+                    "required": [
+                      "uri",
+                      "position"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              ]
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "ratio": {
+              "type": "string",
+              "enum": [
+                "1280:720",
+                "720:1280",
+                "1104:832",
+                "960:960",
+                "832:1104",
+                "1584:672"
+              ]
+            },
+            "duration": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 10
+            },
+            "contentModeration": {
+              "type": "object",
+              "properties": {
+                "publicFigureThreshold": {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "low"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "outputFormat": {
+              "type": "string",
+              "enum": [
+                "mp4",
+                "prores",
+                "png_sequence",
+                "hdr10",
+                "hlg",
+                "sdr_rec709_10bit",
+                "hdr_pq_12bit_master",
+                "hdr_prores",
+                "hdr_png_sequence",
+                "hdr_exr_sequence",
+                "hdr_exr_acescg_sequence_1_3",
+                "hdr_exr_acescg_sequence_2_0"
+              ]
+            },
+            "proresProfile": {
+              "type": "string",
+              "enum": [
+                "422",
+                "4444",
+                "422 Proxy",
+                "422 LT",
+                "422 HQ",
+                "4444 XQ"
+              ]
+            },
+            "model": {
+              "type": "string",
+              "const": "gen4.5"
+            }
+          },
+          "required": [
+            "promptText",
+            "promptImage",
+            "ratio",
+            "duration",
+            "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "promptText": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            },
+            "promptImage": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 2048,
+                      "pattern": "^https:\\/\\/.*"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 5000,
+                      "pattern": "^runway:\\/\\/.*"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 5242880,
+                      "pattern": "^data:image\\/.*"
+                    }
+                  ]
+                },
+                {
+                  "minItems": 1,
+                  "maxItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "uri": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 2048,
+                            "pattern": "^https:\\/\\/.*"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 5000,
+                            "pattern": "^runway:\\/\\/.*"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 5242880,
+                            "pattern": "^data:image\\/.*"
+                          }
+                        ]
+                      },
+                      "position": {
+                        "type": "string",
+                        "const": "first"
+                      }
+                    },
+                    "required": [
+                      "uri",
+                      "position"
+                    ],
+                    "additionalProperties": false
+                  }
+                }
+              ]
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "ratio": {
+              "type": "string",
+              "enum": [
+                "1280:720",
+                "720:1280",
+                "1104:832",
+                "832:1104",
+                "960:960",
+                "1584:672"
+              ]
+            },
+            "duration": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 10
+            },
+            "contentModeration": {
+              "type": "object",
+              "properties": {
+                "publicFigureThreshold": {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "low"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "model": {
+              "type": "string",
+              "const": "gen4_turbo"
+            }
+          },
+          "required": [
+            "promptImage",
+            "ratio",
+            "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "promptImage": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 2048,
+                      "pattern": "^https:\\/\\/.*"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 5000,
+                      "pattern": "^runway:\\/\\/.*"
+                    },
+                    {
+                      "type": "string",
+                      "minLength": 13,
+                      "maxLength": 5242880,
+                      "pattern": "^data:image\\/.*"
+                    }
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "uri": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 2048,
+                            "pattern": "^https:\\/\\/.*"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 5000,
+                            "pattern": "^runway:\\/\\/.*"
+                          },
+                          {
+                            "type": "string",
+                            "minLength": 13,
+                            "maxLength": 5242880,
+                            "pattern": "^data:image\\/.*"
+                          }
+                        ]
+                      },
+                      "position": {
+                        "type": "string",
+                        "enum": [
+                          "first",
+                          "last"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "uri"
+                    ]
+                  }
+                }
+              ]
+            },
+            "promptText": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 15000
+            },
+            "audio": {
+              "default": true,
+              "type": "boolean"
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "duration": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 4,
+                  "maximum": 30
+                },
+                {
+                  "type": "string",
+                  "const": "auto"
+                }
+              ]
+            },
+            "ratio": {
+              "type": "string",
+              "enum": [
+                "992:432",
+                "854:480",
+                "752:560",
+                "640:640",
+                "560:752",
+                "480:854",
+                "1470:630",
+                "1280:720",
+                "1112:834",
+                "960:960",
+                "834:1112",
+                "720:1280",
+                "2206:946",
+                "1920:1080",
+                "1664:1248",
+                "1440:1440",
+                "1248:1664",
+                "1080:1920"
+              ]
+            },
+            "referenceAudio": {
+              "maxItems": 10,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "audio"
+                  },
+                  "uri": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 2048,
+                        "pattern": "^https:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5000,
+                        "pattern": "^runway:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5242880,
+                        "pattern": "^data:audio\\/.*"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "type",
+                  "uri"
+                ]
+              }
+            },
+            "model": {
+              "type": "string",
+              "const": "seedance2_5"
+            }
+          },
+          "required": [
+            "promptImage",
+            "model"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "text_to_video": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "promptText": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000
+            },
+            "ratio": {
+              "type": "string",
+              "enum": [
+                "1280:720",
+                "720:1280"
+              ]
+            },
+            "duration": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 10
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "contentModeration": {
+              "type": "object",
+              "properties": {
+                "publicFigureThreshold": {
+                  "type": "string",
+                  "enum": [
+                    "auto",
+                    "low"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "outputFormat": {
+              "type": "string",
+              "enum": [
+                "mp4",
+                "prores",
+                "png_sequence",
+                "hdr10",
+                "hlg",
+                "sdr_rec709_10bit",
+                "hdr_pq_12bit_master",
+                "hdr_prores",
+                "hdr_png_sequence",
+                "hdr_exr_sequence",
+                "hdr_exr_acescg_sequence_1_3",
+                "hdr_exr_acescg_sequence_2_0"
+              ]
+            },
+            "proresProfile": {
+              "type": "string",
+              "enum": [
+                "422",
+                "4444",
+                "422 Proxy",
+                "422 LT",
+                "422 HQ",
+                "4444 XQ"
+              ]
+            },
+            "model": {
+              "type": "string",
+              "const": "gen4.5"
+            }
+          },
+          "required": [
+            "promptText",
+            "ratio",
+            "duration",
+            "model"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "promptText": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 15000
+            },
+            "audio": {
+              "default": true,
+              "type": "boolean"
+            },
+            "seed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "duration": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 4,
+                  "maximum": 30
+                },
+                {
+                  "type": "string",
+                  "const": "auto"
+                }
+              ]
+            },
+            "ratio": {
+              "type": "string",
+              "enum": [
+                "992:432",
+                "854:480",
+                "752:560",
+                "640:640",
+                "560:752",
+                "480:854",
+                "1470:630",
+                "1280:720",
+                "1112:834",
+                "960:960",
+                "834:1112",
+                "720:1280",
+                "2206:946",
+                "1920:1080",
+                "1664:1248",
+                "1440:1440",
+                "1248:1664",
+                "1080:1920"
+              ]
+            },
+            "references": {
+              "maxItems": 30,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "uri": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 2048,
+                        "pattern": "^https:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5000,
+                        "pattern": "^runway:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5242880,
+                        "pattern": "^data:image\\/.*"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "uri"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "referenceVideos": {
+              "maxItems": 10,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "video"
+                  },
+                  "uri": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 2048,
+                        "pattern": "^https:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5000,
+                        "pattern": "^runway:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5242880,
+                        "pattern": "^data:video\\/.*"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "type",
+                  "uri"
+                ]
+              }
+            },
+            "referenceAudio": {
+              "maxItems": 10,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "audio"
+                  },
+                  "uri": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 2048,
+                        "pattern": "^https:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5000,
+                        "pattern": "^runway:\\/\\/.*"
+                      },
+                      {
+                        "type": "string",
+                        "minLength": 13,
+                        "maxLength": 5242880,
+                        "pattern": "^data:audio\\/.*"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "type",
+                  "uri"
+                ]
+              }
+            },
+            "model": {
+              "type": "string",
+              "const": "seedance2_5"
+            }
+          },
+          "required": [
+            "model"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}
