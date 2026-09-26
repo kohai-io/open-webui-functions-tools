@@ -1,7 +1,7 @@
 """
 title: Runway Video Generation (Inline)
 author: open-webui
-version: 3.0.0
+version: 3.1.1
 license: MIT
 description: Standalone Runway text/image-to-video Pipe with Seedance 2.5, Gen-4.5 and Gen-4 Turbo, optional option dialogs, confirmation, and user-owned Files API players. Enable iframe Sandbox Allow Same Origin for playback.
 requirements: httpx, cryptography, pydantic
@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import re
+import sqlite3
 import time
 from html import escape
 from typing import Any, Literal, Optional
@@ -98,6 +99,7 @@ class Pipe:
         MAX_INPUT_MB: int = Field(default=20, ge=1, le=200, description="Maximum image bytes read from OWUI or data URIs.")
         MAX_VIDEO_MB: int = Field(default=256, ge=1, le=1024, description="Maximum bytes downloaded per video. OWUI's upload limit also applies.")
         ENABLE_STATUS_INDICATOR: bool = True
+        ENABLE_STUDIO_API: bool = Field(default=False, description="Enable Studio Director's structured job API. Studio's Generate action supplies explicit consent instead of chat dialogs. Existing chat confirmation is unchanged.")
 
     class UserValves(BaseModel):
         MODEL: Literal["default", "seedance2_5", "gen4.5", "gen4_turbo"] = "default"
@@ -495,6 +497,15 @@ class Pipe:
         metadata = {**(body.get("metadata") or {}), **(__metadata__ or {})}
         if __task__ or metadata.get("task"):
             return ""
+        messages = body.get("messages") or []
+        content = messages[-1].get("content") if messages else None
+        if isinstance(content, str):
+            try:
+                command = json.loads(content)
+            except (ValueError, TypeError):
+                command = None
+            if isinstance(command, dict) and "studio_director" in command:
+                return await self._studio(command["studio_director"], __user__, __request__)
         task_id = None
         try:
             from open_webui.models.users import Users
@@ -556,6 +567,162 @@ class Pipe:
             self.log.warning("Runway request failed%s", f" for task {task_id}" if task_id else "")
             await self._status(__event_emitter__, "Runway request failed", True)
             return "The Runway request could not be completed. Check the server configuration and Runway task status before retrying." + (f"\n\nRunway task: `{task_id}`" if task_id else "")
+
+    def _studio_db(self):
+        # Independent integration state; never access the OWUI application database directly.
+        from open_webui.env import DATA_DIR
+        db = sqlite3.connect(os.path.join(str(DATA_DIR), "studio-runway-jobs.sqlite3"), timeout=10)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        try:
+            # Serialise the additive migration when several status requests arrive together.
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""CREATE TABLE IF NOT EXISTS job (
+                owner TEXT NOT NULL, id TEXT NOT NULL, input_hash TEXT NOT NULL,
+                state TEXT NOT NULL, task_id TEXT, options TEXT NOT NULL,
+                files TEXT, import_until REAL NOT NULL DEFAULT 0, failure_code TEXT,
+                PRIMARY KEY(owner,id))""")
+            if "failure_code" not in {column["name"] for column in db.execute("PRAGMA table_info(job)")}:
+                db.execute("ALTER TABLE job ADD COLUMN failure_code TEXT")
+            db.commit()
+        except Exception:
+            db.close()
+            raise
+        return db
+
+    @staticmethod
+    def _studio_failure_code(value):
+        # Return bounded diagnostic identifiers, never arbitrary provider messages or URLs.
+        return value if isinstance(value, str) and len(value) <= 128 and re.fullmatch(
+            r"[A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*", value
+        ) else None
+
+    @classmethod
+    def _studio_result(cls, row):
+        result = {"state": row["state"], "jobId": row["id"],
+                  "fileIds": json.loads(row["files"] or "[]")}
+        if row["task_id"]:
+            result["providerTaskId"] = str(UUID(row["task_id"]))
+        if row["state"] == "failed":
+            code = cls._studio_failure_code(row["failure_code"])
+            if code:
+                result["failureCode"] = code
+        return json.dumps(result)
+
+    async def _studio(self, command, context, request):
+        """Versioned JSON-only protocol, using the same credentials, uploads and file delivery as chat."""
+        try:
+            from open_webui.models.users import Users
+            user = await Users.get_user_by_id((context or {}).get("id"))
+            if user is None or request is None:
+                raise ValueError("authentication_required")
+            if not isinstance(command, dict) or command.get("version") != 1:
+                raise ValueError("unsupported_protocol")
+            operation = command.get("operation")
+            if operation == "capabilities":
+                return json.dumps({"protocol": 1, "enabled": self.valves.ENABLE_STUDIO_API,
+                    "model": "seedance2_5", "firstFrame": True, "lastFrame": False,
+                    "extraReferences": False, "audio": True, "durationMin": 4, "durationMax": 30,
+                    "ratios": ["16:9", "9:16", "1:1"], "resolution": "720p"})
+            if not self.valves.ENABLE_STUDIO_API:
+                raise ValueError("studio_api_disabled")
+            job_id = str(UUID(command.get("jobId", "")))
+            db = self._studio_db()
+            try:
+                row = db.execute("SELECT * FROM job WHERE owner=? AND id=?", (user.id, job_id)).fetchone()
+                if operation == "submit":
+                    if command.get("confirmed") is not True:
+                        raise ValueError("generation_not_confirmed")
+                    prompt = command.get("prompt")
+                    if not isinstance(prompt, str) or not prompt.strip():
+                        raise ValueError("prompt_required")
+                    first = command.get("firstFrameFileId") or ""
+                    if first:
+                        first = str(UUID(first))
+                    if command.get("lastFrameFileId") or command.get("referenceFileIds"):
+                        raise ValueError("only_first_frame_supported")
+                    options = {"model": "seedance2_5", "duration": command.get("duration"),
+                        "aspect_ratio": command.get("ratio"), "resolution": "720p", "audio": True}
+                    self._payload(prompt, "image" if first else None, options)
+                    input_hash = hashlib.sha256(json.dumps([prompt, first, options], sort_keys=True).encode()).hexdigest()
+                    if row:
+                        if row["input_hash"] != input_hash:
+                            raise ValueError("idempotency_conflict")
+                        return self._studio_result(row)
+                    # Store intent before any remote request. Never repeat this POST after an ambiguous response.
+                    try:
+                        db.execute("INSERT INTO job(owner,id,input_hash,state,options) VALUES (?,?,?,?,?)",
+                            (user.id, job_id, input_hash, "submission-unknown", json.dumps(options)))
+                        db.commit()
+                    except sqlite3.IntegrityError:
+                        db.rollback()
+                        raise ValueError("submission_in_progress") from None
+                elif operation != "status" or row is None:
+                    raise ValueError("job_not_found")
+                if operation == "status" and row["state"] in ("succeeded", "failed", "cancelled", "submission-unknown"):
+                    return self._studio_result(row)
+                key = EncryptedStr.decrypt(str(self.valves.RUNWAY_API_KEY)) or os.getenv("RUNWAYML_API_SECRET", "")
+                base = self.valves.API_BASE_URL.rstrip("/") + "/"
+                parts = urlsplit(base)
+                if not key or parts.scheme != "https" or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+                    raise ValueError("invalid_runway_configuration")
+                async with httpx.AsyncClient(base_url=base, timeout=60, headers={
+                    "Authorization": f"Bearer {key}", "X-Runway-Version": "2024-11-06",
+                }) as api:
+                    if operation == "submit":
+                        image = await self._read_image(f"/api/v1/files/{first}/content", user) if first else None
+                        prepared = await self._prepare_image(image, api)
+                        endpoint, payload = self._payload(prompt, prepared, options)
+                        submitted = await self._api(api, "POST", endpoint, payload)
+                        task_id = str(UUID(submitted["id"]))
+                        db.execute("UPDATE job SET state='running',task_id=? WHERE owner=? AND id=?", (task_id, user.id, job_id))
+                        db.commit()
+                        return json.dumps({"state": "running", "jobId": job_id, "providerTaskId": task_id})
+                    task = await self._api(api, "GET", f"tasks/{row['task_id']}")
+                    status = task.get("status")
+                    if status in ("FAILED", "CANCELLED", "CANCELED"):
+                        state = "failed" if status == "FAILED" else "cancelled"
+                        code = self._studio_failure_code(task.get("failureCode")) if state == "failed" else None
+                        db.execute("UPDATE job SET state=?,failure_code=? WHERE owner=? AND id=?",
+                            (state, code, user.id, job_id))
+                        db.commit()
+                        return self._studio_result(db.execute(
+                            "SELECT * FROM job WHERE owner=? AND id=?", (user.id, job_id)).fetchone())
+                    if status != "SUCCEEDED":
+                        if status not in ("PENDING", "RUNNING", "THROTTLED"):
+                            raise ValueError("unexpected_provider_status")
+                        return json.dumps({"state": "running", "jobId": job_id, "providerTaskId": row["task_id"]})
+                    # Serialise imports across workers; expired leases permit recovery after a crash.
+                    claimed = db.execute("UPDATE job SET import_until=? WHERE owner=? AND id=? AND import_until < ? AND state='running'",
+                        (time.time() + self.valves.DOWNLOAD_TIMEOUT + 120, user.id, job_id, time.time())).rowcount
+                    db.commit()
+                    if not claimed:
+                        return json.dumps({"state": "running", "jobId": job_id, "providerTaskId": row["task_id"]})
+                    try:
+                        outputs = task.get("output")
+                        if not isinstance(outputs, list) or len(outputs) != 1:
+                            raise ValueError("expected_one_video_output")
+                        data = await self._download(outputs[0])
+                        url, _ = await self._save(data, request, user, {}, json.loads(row["options"]), row["task_id"], 1)
+                        match = re.search(r"/files/([a-fA-F0-9-]+)/content", url)
+                        if not match:
+                            raise ValueError("invalid_saved_file")
+                        files = [str(UUID(match.group(1)))]
+                        db.execute("UPDATE job SET state='succeeded',files=? WHERE owner=? AND id=?", (json.dumps(files), user.id, job_id))
+                        db.commit()
+                        return json.dumps({"state": "succeeded", "jobId": job_id,
+                            "providerTaskId": row["task_id"], "fileIds": files})
+                    finally:
+                        db.execute("UPDATE job SET import_until=0 WHERE owner=? AND id=?", (user.id, job_id))
+                        db.commit()
+            finally:
+                db.close()
+        except (ValueError, TypeError, KeyError, RunwayError):
+            # Do not expose provider URLs, credentials or raw upstream response bodies.
+            return json.dumps({"error": "studio_request_failed"})
+        except Exception:
+            self.log.warning("Studio Runway request failed")
+            return json.dumps({"error": "studio_request_failed"})
 
     @staticmethod
     def _video_embed_html(content_url: str, filename: str) -> str:
