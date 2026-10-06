@@ -51,7 +51,10 @@ def test_reader_follows_app_theme_on_open_toggle_and_reopen(
         browser = playwright.chromium.launch(
             channel="chrome",
             headless=True,
-            args=["--force-dark-mode"] if browser_dark else [],
+            # Set Blink's native preference in both directions so a dark-mode
+            # Windows host cannot turn the light-browser case into dark mode.
+            # Unlike media emulation, this still permits iframe scheme inheritance.
+            args=[f"--blink-settings=preferredColorScheme={0 if browser_dark else 1}"],
         )
         # Literal "null" disables Playwright's default forced-light emulation.
         page = browser.new_page(color_scheme="null")
