@@ -1,8 +1,8 @@
 """
 title: Document Reader
 author: Document Reader contributors
-version: 0.5.0
-description: Five linked reading levels for pasted text, Markdown, an attached webpage or document. Uses OWUI extraction and saves an interactive reader in the chat.
+version: 0.6.0
+description: Five linked reading levels for text, Markdown, documents, webpages and OWUI Notes. Search the source, ask passage questions and send a reading brief to chat.
 required_open_webui_version: 0.11.3
 license: MIT
 """
@@ -901,6 +901,188 @@ def parse_question(text: str, chat_id: str) -> Optional[dict]:
     return {**ref, "question": question}
 
 
+BRIEF_MARKER = "document-reader-brief-v1="
+
+
+def parse_brief(text, chat_id):
+    if BRIEF_MARKER not in text and not re.match(r"^\s*# Reader brief\b", text):
+        return None
+    error = (
+        "Invalid reading brief reference. Use Send brief to chat in the saved Reader."
+    )
+    try:
+        if len(text) > 10000 or not re.match(r"^\s*# Reader brief\s*\n", text):
+            raise ValueError()
+        links = list(re.finditer(r"\[Source:[^\r\n]*?\]\(<?([^\s<>]+?)>?\)", text))
+        if (
+            len(links) != 1
+            or text.count(BRIEF_MARKER) != 1
+            or QUESTION_MARKER in text
+            or RETRY_MARKER in text
+        ):
+            raise ValueError()
+        url = urlsplit(links[0].group(1))
+        if (
+            url.scheme
+            or url.netloc
+            or url.query
+            or url.path != "/c/" + quote(chat_id, safe="")
+            or not url.fragment.startswith(BRIEF_MARKER)
+        ):
+            raise ValueError()
+        encoded = url.fragment[len(BRIEF_MARKER) :]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,4000}", encoded):
+            raise ValueError()
+        ref = json.loads(
+            base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)),
+            object_pairs_hook=_unique_json,
+        )
+        if (
+            not isinstance(ref, dict)
+            or set(ref) != {"v", "message", "fingerprint", "passages", "explanations"}
+            or type(ref["v"]) is not int
+            or ref["v"] != 1
+        ):
+            raise ValueError()
+        if not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", ref["message"]
+        ) or not re.fullmatch(r"[a-f0-9]{64}", ref["fingerprint"]):
+            raise ValueError()
+        ids = ref["passages"]
+        if (
+            not isinstance(ids, list)
+            or not 1 <= len(ids) <= 50
+            or type(ref["explanations"]) is not bool
+        ):
+            raise ValueError()
+        if any(
+            not isinstance(pid, str) or not re.fullmatch(r"p\d{1,6}", pid)
+            for pid in ids
+        ) or len(set(ids)) != len(ids):
+            raise ValueError()
+        ref["passage"] = ids[0]  # Shared saved-snapshot validation.
+        return ref
+    except (ValueError, TypeError, KeyError, UnicodeError, ReaderError):
+        raise ReaderError(error) from None
+
+
+def citation_offset(metadata):
+    """Match OWUI Citations.svelte grouping for sources added by outer middleware."""
+    ids = set()
+    for source in metadata.get("sources") or []:
+        if not isinstance(source, dict):
+            continue
+        documents, records = source.get("document") or [], source.get("metadata") or []
+        origin = source.get("source") or {}
+        for index in range(len(documents)):
+            record = (
+                records[index]
+                if index < len(records) and isinstance(records[index], dict)
+                else {}
+            )
+            key = record.get("source")
+            if key is None:
+                key = origin.get("id")
+            ids.add(str(key) if key is not None else "N/A")
+    return len(ids)
+
+
+def citation_key(snapshot, uid):
+    return "document-reader:" + snapshot["reader_message_id"] + ":" + uid
+
+
+def chat_brief(snapshot, ref, offset=0):
+    """Rebuild the brief from the saved edition, never client-supplied prose."""
+    selected = set(ref["passages"])
+    if not selected <= {p["id"] for p in snapshot["passages"]}:
+        raise ReaderError(
+            "This brief references an unknown passage. Select its points again."
+        )
+    sections = {s["id"]: s["title"] for s in snapshot["sections"]}
+    out = [
+        "## Reading brief: " + markdown_text(snapshot["filename"]),
+        "AI takeaways and explanations from the saved edition. Inspect the citations for exact source wording.",
+    ]
+    if snapshot.get("status") == "partial":
+        out.append(
+            "Some reading levels were not prepared; source-only points are labelled below."
+        )
+    citations, section = [], None
+    for p in snapshot["passages"]:
+        if p["id"] not in selected:
+            continue
+        if section != p["section_id"]:
+            section = p["section_id"]
+            out.append("### " + markdown_text(sections[section]))
+        eligible = {
+            u["id"]: u
+            for u in p["units"]
+            if not u.get("excluded") and u["text"].strip()
+        }
+        generated = p.get("generated")
+        if generated and not p.get("source_only"):
+            try:
+                parsed = PassageResult.model_validate({**generated, "id": p["id"]})
+                all_items = parsed.takeaways + parsed.explanation
+                if any(uid not in eligible for uid in parsed.extract_ids) or any(
+                    uid not in eligible for item in all_items for uid in item.evidence
+                ):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                raise ReaderError(
+                    "A saved brief point has invalid evidence. Prepare a fresh Reader."
+                ) from None
+            items = [(item.text, item.evidence) for item in parsed.takeaways]
+            if ref["explanations"]:
+                items += [
+                    ("Explanation: " + item.text, item.evidence)
+                    for item in parsed.explanation
+                ]
+        else:
+            # Quote preserved source, with a fence that cannot be closed by its text.
+            source = "".join(u["text"] for u in eligible.values())
+            if not source:
+                continue
+            fence = "`" * max(
+                3,
+                max(
+                    (len(m.group()) + 1 for m in re.finditer(r"`+", source)), default=3
+                ),
+            )
+            out.append(
+                "**Source only**\n\n"
+                + fence
+                + "text\n"
+                + source
+                + ("" if source.endswith("\n") else "\n")
+                + fence
+            )
+            items = [("Source wording", list(eligible))]
+        for text, evidence in items:
+            numbers = []
+            for uid in dict.fromkeys(evidence):
+                key = (p["id"], uid)
+                existing = next(
+                    (
+                        i
+                        for i, (q, u) in enumerate(citations)
+                        if (q["id"], u["id"]) == key
+                    ),
+                    None,
+                )
+                if existing is None:
+                    existing = len(citations)
+                    citations.append((p, eligible[uid]))
+                numbers.append(f"[{offset + existing + 1}]")
+            out.append("- " + markdown_text(text) + " " + "".join(numbers))
+    output = "\n\n".join(out)
+    if len(output) + sum(len(u["text"]) for _, u in citations) > 60000:
+        raise ReaderError(
+            "The chat brief exceeds 60,000 characters including its evidence. Select fewer points."
+        )
+    return output, citations
+
+
 def question_snapshot(
     html: str, ref: dict, chat_id: str, max_bytes=2 * 1024 * 1024
 ) -> dict:
@@ -928,12 +1110,16 @@ def question_snapshot(
             "paste",
             "text",
             "web",
+            "note",
         ):
             raise ValueError()
         if origin["kind"] == "file":
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", s["file_id"]):
                 raise ValueError()
-        elif not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", origin.get("message_id", "")):
+        elif not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}",
+            origin.get("note_id" if origin["kind"] == "note" else "message_id", ""),
+        ):
             raise ValueError()
         if not isinstance(s["filename"], str) or len(s["filename"]) > 1000:
             raise ValueError()
@@ -1101,21 +1287,24 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
 .source-unit.selected-evidence{background:var(--wash);text-decoration:underline;text-decoration-color:var(--accent);text-decoration-thickness:2px;text-underline-offset:3px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
 .zoom-layer{position:absolute;left:0;overflow:hidden;pointer-events:none;user-select:none;contain:strict;z-index:2}.zoom-word{position:absolute;white-space:pre;transform-origin:0 0;pointer-events:none}.reading-content.zooming .source-text,.reading-content.zooming .generated-text,.reading-content.zooming .section-title{opacity:0}
 .level-bar{flex-wrap:wrap;gap:8px 20px}.levels{touch-action:pan-y}.level-hint{flex-basis:100%;font-size:10px;color:var(--muted);margin-left:96px}.level[data-zoom-target=true]{outline:2px dashed var(--accent);outline-offset:1px}.header-actions{flex-wrap:wrap}.brief-toggle[aria-pressed=true]{font-weight:600}.brief-list{padding:0;list-style:none}.brief-list li{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.brief-list li span{flex:1;min-width:0;overflow-wrap:anywhere}.brief-list button{flex-shrink:0;font-size:11px}.question-field{width:100%;min-height:85px;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--paper);resize:vertical}.question-presets{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.question-presets button{font-size:11px}.source-preview{margin:12px 0}.source-preview .source-text{max-height:150px;overflow:auto;font-size:13px}.dialog-footer{flex-wrap:wrap}#brief-preview{min-height:200px}#brief-button{font-size:12px}@media(max-width:650px){.level-hint{margin-left:0}.header-actions{justify-content:flex-end}.level-bar{gap:7px}.levels{flex-basis:100%}.header-actions #brief-button{font-size:11px}.dialog-footer{gap:8px}}
+.search-results{display:grid;gap:8px}.search-result{text-align:left;white-space:normal;padding:12px;font-size:13px;line-height:1.6}.search-result strong{display:block;font-size:11px;color:var(--muted)}.search-result mark{background:var(--source);color:var(--ink)}#search-input{width:100%;min-height:42px;margin-bottom:12px}#brief-dialog .dialog-footer{flex-wrap:wrap}
 </style>
 </head>
 <body>
 <div id="fallback"><h1>Document Reader</h1><p>The interactive reader could not start. This embed needs scripts enabled by your Open WebUI administrator. Your original document is available from its chat attachment.</p></div>
 <main id="reader" hidden aria-label="Document Reader">
-  <header class="masthead"><div class="identity"><div class="brand eyebrow"><span class="brand-mark" aria-hidden="true">▤</span> Document Reader</div><h1 id="filename"></h1></div><div class="header-actions"><span class="status" id="snapshot-status"></span><button id="retry-button" hidden>Retry missing sections</button><button id="brief-button">Brief (0)</button><button id="focus-button" aria-label="Focus reading" title="Read without the chat controls">Focus reading</button><button id="info-button" class="icon-button" aria-label="About this reader">i</button></div></header>
+  <header class="masthead"><div class="identity"><div class="brand eyebrow"><span class="brand-mark" aria-hidden="true">▤</span> Document Reader</div><h1 id="filename"></h1></div><div class="header-actions"><span class="status" id="snapshot-status"></span><button id="retry-button" hidden>Retry missing sections</button><button id="search-button">Find</button><button id="brief-button">Brief (0)</button><button id="focus-button" aria-label="Focus reading" title="Read without the chat controls">Focus reading</button><button id="info-button" class="icon-button" aria-label="About this reader">i</button></div></header>
   <div class="level-bar"><div class="level-caption">Overview<br>to detail</div><div id="level-controls" class="levels" role="group" aria-label="Reading level" aria-describedby="level-hint"></div><span class="level-hint" id="level-hint">Scroll here for more or less detail, or drag to a level.</span></div>
   <div class="context-strip"><span id="context-copy" class="context-copy"></span><label class="sr-only" for="section-select">Go to section</label><select id="section-select" aria-label="Go to section"></select><span id="coverage-note" class="context-copy"></span><span id="brief-limit" role="status" hidden></span></div>
   <div class="workspace"><nav class="outline" aria-label="Document sections"><p class="outline-heading eyebrow">In this document</p><div id="outline-list" class="outline-list"></div><p class="outline-hint">Start with the point.<br>Unfold its source when you need the detail.</p></nav><div id="reading-column" role="region" aria-label="Document content" tabindex="0"><div id="reading-content" class="reading-content"></div></div></div>
   <footer class="footer"><div class="footer-top"><span id="position" class="position"></span><div class="bookmark-actions"><button id="save-place" class="text-button">Save place</button><button id="restore-place" class="text-button">Restore place</button></div></div><div class="progress" aria-hidden="true"><div id="progress-fill" class="progress-fill"></div></div><p id="resume-note" class="privacy">Checking whether your reading position can be saved on this browser…</p></footer>
 </main>
 <div id="reader-announcement" class="sr-only" role="status" aria-live="polite"></div>
+<dialog id="search-dialog" aria-labelledby="search-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="search-title">Find in document</h2><button class="close" aria-label="Close search" data-close="search-dialog">×</button></header><div class="dialog-body"><label class="field-label" for="search-input">Search the complete source</label><input id="search-input" class="question-field" type="search" maxlength="200" placeholder="Find a word or phrase" autocomplete="off"><p id="search-status" class="dialog-description" role="status">Search includes text hidden at shorter reading levels.</p><div id="search-results" class="search-results"></div></div></div></dialog>
+<dialog id="brief-send-dialog" aria-labelledby="brief-send-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="brief-send-title">Send brief to chat</h2><button class="close" aria-label="Close brief draft" data-close="brief-send-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">This creates a normal chat response with your selected points and source citations, without a model call. Replace chat draft replaces any current draft; check it and press Send with Document Reader selected. Use Copy draft if the composer hook is unavailable.</p><label class="field-label" for="brief-chat-draft">Brief request</label><textarea id="brief-chat-draft" class="bookmark-text" readonly></textarea><p id="brief-chat-feedback" role="status" class="dialog-description"></p></div><footer class="dialog-footer"><button id="brief-chat-replace">Replace chat draft</button><button id="brief-chat-copy">Copy draft</button></footer></div></dialog>
 <dialog id="retry-dialog" aria-labelledby="retry-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="retry-title">Retry missing sections</h2><button class="close" aria-label="Close retry" data-close="retry-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Reuse the prepared sections and try the missing ones again. This creates a new Reader in chat. The source, model and preparation settings must still match.</p><p class="dialog-description">Replace chat draft replaces any current draft. Check it in chat and send with Document Reader selected. If the composer hook is unavailable, copy and paste the draft.</p><label class="field-label" for="retry-draft">Retry draft</label><textarea id="retry-draft" class="bookmark-text" readonly spellcheck="false"></textarea><p id="retry-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="retry-replace">Replace chat draft</button><button id="retry-copy" class="primary">Copy retry</button></footer></div></dialog>
 <dialog id="question-dialog" aria-labelledby="question-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Saved passage</div><h2 id="question-title">Ask about this passage</h2></div><button class="close" aria-label="Close question" data-close="question-dialog">×</button></header><div class="dialog-body"><p id="question-location" class="dialog-description"></p><label class="field-label" for="question-input">Your question</label><textarea id="question-input" class="question-field" maxlength="2000" placeholder="What do you want to understand?"></textarea><div id="question-presets" class="question-presets"></div><details class="source-preview"><summary>Source context</summary><div id="question-source" class="source-text"></div></details><p class="dialog-description">Copy the draft below, paste it into chat and send with Document Reader selected. It includes a reference to this saved passage. Replace chat draft uses OWUI's existing composer hook and replaces any current draft; you still press Send.</p><label class="field-label" for="question-draft">Question draft</label><textarea id="question-draft" class="bookmark-text" readonly spellcheck="false"></textarea><p id="question-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="question-replace">Replace chat draft</button><button id="question-copy" class="primary">Copy question</button></footer></div></dialog>
-<dialog id="brief-dialog" aria-labelledby="brief-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Reading brief</div><h2 id="brief-title">Keep the useful points</h2></div><button class="close" aria-label="Close brief" data-close="brief-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Takeaways with supporting source wording. Add passages as you read, then download to keep this brief. Selections reset when this Reader is reopened.</p><p id="brief-empty" class="empty">Nothing selected yet. Use Add to brief on a passage or in Inspect source.</p><ul id="brief-list" class="brief-list"></ul><label><input id="brief-explanations" type="checkbox"> Include AI explanations</label><p id="brief-error" class="error" role="alert" hidden></p><label class="field-label" for="brief-preview">Markdown preview</label><textarea id="brief-preview" class="bookmark-text" readonly spellcheck="false"></textarea><p id="brief-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="brief-copy">Copy brief</button><button id="brief-download" class="primary">Download Markdown</button></footer></div></dialog>
+<dialog id="brief-dialog" aria-labelledby="brief-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Reading brief</div><h2 id="brief-title">Keep the useful points</h2></div><button class="close" aria-label="Close brief" data-close="brief-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Takeaways with supporting source wording. Add passages as you read, then download to keep this brief. Selections reset when this Reader is reopened.</p><p id="brief-empty" class="empty">Nothing selected yet. Use Add to brief on a passage or in Inspect source.</p><ul id="brief-list" class="brief-list"></ul><label><input id="brief-explanations" type="checkbox"> Include AI explanations</label><p id="brief-error" class="error" role="alert" hidden></p><label class="field-label" for="brief-preview">Markdown preview</label><textarea id="brief-preview" class="bookmark-text" readonly spellcheck="false"></textarea><p id="brief-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="brief-send">Send brief to chat</button><button id="brief-copy">Copy brief</button><button id="brief-download" class="primary">Download Markdown</button></footer></div></dialog>
 <dialog id="source-dialog" aria-labelledby="source-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Verbatim evidence</div><h2 id="source-title">Source wording</h2></div><button class="close" aria-label="Close source" data-close="source-dialog">×</button></header><div class="dialog-body" id="source-body"><p class="dialog-description">Exact saved source text. Extracted files and webpages may differ from their original layout. Cited text is highlighted. The selected evidence is underlined.</p><div id="source-citations" class="citation-list" role="group" aria-label="Cited source units"></div><p id="source-location" class="source-location"></p><div id="source-text" class="source-text"></div></div><footer class="dialog-footer"><button id="source-previous">← Previous passage</button><span id="source-count" class="quiet"></span><button id="source-next">Next passage →</button></footer></div></dialog>
 <dialog id="bookmark-dialog" aria-labelledby="bookmark-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Manual bookmark</div><h2 id="bookmark-title">Save your place</h2></div><button class="close" aria-label="Close bookmark" data-close="bookmark-dialog">×</button></header><div class="dialog-body"><p id="bookmark-description" class="dialog-description"></p><label class="field-label" for="bookmark-text">Bookmark token</label><textarea id="bookmark-text" class="bookmark-text" spellcheck="false" autocomplete="off"></textarea><p id="bookmark-error" class="error" role="alert" hidden></p></div><footer class="dialog-footer"><span class="quiet">Contains your position, not document text.</span><button id="bookmark-action" class="primary"></button></footer></div></dialog>
 <dialog id="info-dialog" aria-labelledby="info-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Saved snapshot</div><h2 id="info-title">About this reader</h2></div><button class="close" aria-label="Close information" data-close="info-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Full text and extracts use your pasted text or the extraction supplied by Open WebUI. Explanations, takeaways and overviews are AI generated: inspect the source to check their meaning.</p><div id="snapshot-details"></div><p class="info-privacy">This reader is saved in the chat and contains the full source document. Sharing or exporting the chat may disclose that text. Removing the original input or its access does not remove this saved copy.</p><p class="dialog-description">Start with the section map and explore source-linked key concepts. Reading controls work locally. Your reading level and position are saved on this browser when storage is available. Save place provides an optional portable bookmark; the footer reports whether automatic saving is supported.</p><p class="dialog-description">To prepare the document again, paste its text or attach the intended file or webpage in chat. This creates a new snapshot and may regenerate every passage; this saved reader does not update in the background.</p></div></div></dialog>
@@ -1470,7 +1659,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     const list=$('brief-list');list.replaceChildren();$('brief-empty').hidden=briefSelection.size>0;
     data.passages.filter(p=>briefSelection.has(p.id)).forEach(p=>{const item=el('li'),label=el('span','',sections.get(p.section_id)?.title+' · '+((p.generated?.takeaways?.[0]?.text)||p.units.map(u=>u.text).join('')).slice(0,150));item.append(label,button('Remove','',()=>toggleBrief(p.id)));list.append(item);});
     const text=briefSelection.size?buildBrief():'',tooLarge=text.length>60000;$('brief-preview').value=text;$('brief-error').hidden=!tooLarge;$('brief-error').textContent='This brief exceeds 60,000 characters. Remove a passage or turn off explanations.';
-    $('brief-download').disabled=$('brief-copy').disabled=!text||tooLarge;$('brief-feedback').textContent='';
+    $('brief-download').disabled=$('brief-copy').disabled=!text||tooLarge;$('brief-send').disabled=!text||tooLarge||!data.reader_message_id||!data.reader_chat_id;$('brief-feedback').textContent='';
   }
   async function copyText(field,feedback){
     field.focus();field.select();let copied=false;
@@ -1487,6 +1676,38 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     a.download=(data.filename.replace(/\.[^.]+$/,'').replace(/[^a-zA-Z0-9_-]+/g,'-').slice(0,90)||'document')+'-reading-brief.md';document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
     $('brief-feedback').textContent='Download requested. If your browser blocks it, use Copy brief or the preview.';
   });
+
+  $('brief-send').addEventListener('click',()=>{
+    if(!briefSelection.size||buildBrief().length>60000)return;
+    const ref={v:1,message:data.reader_message_id,fingerprint:data.fingerprint,passages:data.passages.filter(p=>briefSelection.has(p.id)).map(p=>p.id),explanations:$('brief-explanations').checked};
+    const encoded=btoa(JSON.stringify(ref)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+    $('brief-chat-draft').value='# Reader brief\n\nSend these selected reading points to chat with source citations.\n\n[Source: saved Reader](/c/'+encodeURIComponent(data.reader_chat_id)+'#document-reader-brief-v1='+encoded+')';
+    $('brief-chat-feedback').textContent='';$('brief-dialog').close();showDialog('brief-send-dialog',$('brief-button'));
+  });
+  $('brief-chat-copy').addEventListener('click',()=>copyText($('brief-chat-draft'),$('brief-chat-feedback')));
+  $('brief-chat-replace').addEventListener('click',()=>{if(!$('brief-chat-draft').value)return;window.parent.postMessage({type:'input:prompt',text:$('brief-chat-draft').value},'*');$('brief-chat-feedback').textContent='Draft placed in chat. Close this dialog, check the draft and press Send with Document Reader selected.';});
+  function searchSource(){
+    const query=$('search-input').value.trim(),list=$('search-results');list.replaceChildren();
+    if(!query){$('search-status').textContent='Search includes text hidden at shorter reading levels.';return;}
+    const pattern=query.split(/\s+/).map(s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('\\s+'),matches=[];let count=0;
+    for(const p of passages.values()){
+      const text=p.units.map(u=>u.text).join(''),re=new RegExp(pattern,'giu');
+      for(const hit of text.matchAll(re)){count++;if(matches.length<100)matches.push({p,text,start:hit.index,end:hit.index+hit[0].length});}
+    }
+    $('search-status').textContent=count?(count+(count===1?' match':' matches')+' in source'+(count>100?' · showing the first 100; refine your search.':'.')):'No matches in the source. Try a shorter word or phrase.';
+    for(const m of matches){
+      const {p,text,start,end}=m,b=button('','search-result',()=>{
+        $('search-dialog').close();stopZoom();resumeTouched=true;state.level='full';render();restoreAnchor({id:p.id,offset:18});updatePosition();
+        const article=$('passage-'+p.id);article.tabIndex=-1;article.focus({preventScroll:true});let offset=0;const ids=[];
+        for(const u of p.units){if(offset<end&&offset+u.text.length>start)ids.push(u.id);offset+=u.text.length;}
+        inspect(ids,article,p.id);announce('Found in '+sections.get(p.section_id)?.title+'. Matching source units are highlighted.');
+      });
+      b.append(el('strong','',(sections.get(p.section_id)?.title||'Source')+' · Passage '+(p.index+1)));
+      b.append(document.createTextNode((start>70?'…':'')+text.slice(Math.max(0,start-70),start)),el('mark','',text.slice(start,end)),document.createTextNode(text.slice(end,end+110)+(end+110<text.length?'…':'')));list.append(b);
+    }
+  }
+  $('search-button').addEventListener('click',e=>{showDialog('search-dialog',e.currentTarget);$('search-input').focus();});
+  $('search-input').addEventListener('input',searchSource);
   $('retry-button').hidden=!(data.status==='partial'&&data.preparation_identity&&data.reader_message_id&&data.reader_chat_id);
   $('retry-button').addEventListener('click',e=>{
     const ref={v:1,message:data.reader_message_id,fingerprint:data.fingerprint,passage:data.passages[0].id};
@@ -1655,7 +1876,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   $('snapshot-status').textContent=data.status==='partial'?'Partly prepared':'Ready to read';$('snapshot-status').classList.toggle('partial',data.status==='partial');
   $('coverage-note').textContent=data.status==='partial'?'Some explanations are unavailable':data.sections.filter(s=>!isFront(s)).length+' sections';$('coverage-note').classList.toggle('partial-note',data.status==='partial');
   const details=el('dl','snapshot-meta');[['Document',data.filename],['Model',data.model_id],['Prepared',data.created_at],['Coverage',data.status==='partial'?'Partial snapshot':'Prepared snapshot']].forEach(([key,value])=>{details.append(el('dt','',key),el('dd','',value||'Not recorded'));});$('snapshot-details').append(details);
-  const origin=data.source_origin||{kind:'file'};const originLabel={file:'Attached file · OWUI extraction',paste:'Pasted text / Markdown',text:'Attached text',web:'Attached webpage · saved OWUI extraction'}[origin.kind]||'Saved source';$('snapshot-details').append(el('p','',originLabel));if(origin.url)$('snapshot-details').append(el('p','',origin.url));
+  const origin=data.source_origin||{kind:'file'};const originLabel={file:'Attached file · OWUI extraction',paste:'Pasted text / Markdown',text:'Attached text',web:'Attached webpage · saved OWUI extraction',note:'OWUI Note · saved Markdown edition'}[origin.kind]||'Saved source';$('snapshot-details').append(el('p','',originLabel));if(origin.url)$('snapshot-details').append(el('p','',origin.url));
   if(data.generation){const g=data.generation;$('snapshot-details').append(el('p','',g.completed_batches+' of '+g.total_batches+' batches prepared · '+(g.reused_batches||0)+' reused · '+g.calls+' new model calls.'));}
   if((data.warnings||[]).length){const list=el('ul','detail-list');data.warnings.forEach(w=>list.append(el('li','',w)));$('snapshot-details').append(el('h3','eyebrow','Preparation notes'),list);}
   (data.extraction_metadata||[]).forEach(note=>{const n=el('aside','source-metadata');n.append(el('div','eyebrow quiet','Document edition · extracted footer'),el('p','',note.text),evidenceButton(note.evidence,units.get(note.evidence[0])?.passageId));$('snapshot-details').append(n);});
@@ -1778,6 +1999,12 @@ class Pipe:
             raise ReaderError(
                 "The current message has invalid attachments. Attach one document or webpage again."
             )
+        if (
+            len(attachments) == 1
+            and isinstance(attachments[0], dict)
+            and attachments[0].get("type") == "note"
+        ):
+            return await self._load_note(attachments[0].get("id"), user)
         if attachments and all(
             isinstance(a, dict) and a.get("type", "file") == "file" for a in attachments
         ):
@@ -1861,6 +2088,8 @@ class Pipe:
 
     async def _saved_input(self, snapshot, metadata, user, valves, emitter):
         origin = snapshot.get("source_origin", {"kind": "file"})
+        if origin["kind"] == "note":
+            return await self._load_note(origin["note_id"], user)
         if origin["kind"] == "file":
             file, text, warnings = await self._load_source(
                 snapshot["file_id"], user, valves, emitter
@@ -1884,6 +2113,51 @@ class Pipe:
             user,
             valves,
             emitter,
+        )
+
+    @staticmethod
+    async def _load_note(note_id, user):
+        from open_webui.models.notes import Notes
+        from open_webui.models.access_grants import AccessGrants
+        from open_webui.models.config import Config
+        from open_webui.utils.access_control import has_permission
+
+        if not isinstance(note_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]{1,128}", note_id
+        ):
+            raise ReaderError("Attach one saved OWUI Note with a valid ID.")
+        # Mirror OWUI's Notes read route, including feature permission for owners.
+        if user.role != "admin" and not await has_permission(
+            user.id, "features.notes", await Config.get("user.permissions")
+        ):
+            raise ReaderError("You do not have access to OWUI Notes.")
+        note = await Notes.get_note_by_id(note_id)
+        if note is None or not (
+            user.role == "admin"
+            or note.user_id == user.id
+            or await AccessGrants.has_access(
+                user_id=user.id,
+                resource_type="note",
+                resource_id=note_id,
+                permission="read",
+            )
+        ):
+            raise ReaderError(
+                "The original Note is unavailable or you no longer have access to it."
+            )
+        data = note.data if isinstance(note.data, dict) else {}
+        content = data.get("content") if isinstance(data.get("content"), dict) else {}
+        text = content.get("md")
+        if not isinstance(text, str) or not text.strip():
+            raise ReaderError(
+                "This Note has no readable Markdown. Add text in OWUI Notes first."
+            )
+        return (
+            str(note.title or "OWUI Note")[:990] + ".md",
+            text,
+            "",
+            {"kind": "note", "note_id": note_id},
+            [],
         )
 
     @staticmethod
@@ -2524,6 +2798,74 @@ class Pipe:
             embeds[0], ref, metadata["chat_id"], valves.MAX_EMBED_BYTES
         )
 
+    async def _current_source(self, snapshot, metadata, user, valves, emitter):
+        from open_webui.models.files import Files
+        from open_webui.utils.access_control.files import has_access_to_file
+
+        origin = snapshot.get("source_origin", {"kind": "file"})
+        if origin["kind"] == "file":
+            file = await Files.get_file_by_id(snapshot["file_id"])
+            if file is None or not (
+                file.user_id == user.id
+                or user.role == "admin"
+                or await has_access_to_file(snapshot["file_id"], "read", user)
+            ):
+                raise ReaderError(
+                    "The original document is unavailable or you no longer have access to it."
+                )
+            current = (file.data if isinstance(file.data, dict) else {}).get("content")
+        else:
+            _, current, _, current_origin, _ = await self._saved_input(
+                snapshot, metadata, user, valves, emitter
+            )
+            if current_origin != origin:
+                raise ReaderError(
+                    "The original input type or webpage reference changed. Prepare a new Reader from that input."
+                )
+        return current
+
+    @staticmethod
+    def _citation_origin(snapshot):
+        origin = snapshot.get("source_origin", {"kind": "file"})
+        if origin["kind"] == "file":
+            return {"file_id": snapshot["file_id"]}
+        if origin["kind"] == "note":
+            return {"note_id": origin["note_id"]}
+        return {"source_message_id": origin["message_id"]}
+
+    async def _publish_brief(self, ref, metadata, user, valves, emitter):
+        snapshot = await self._retry_snapshot(ref, metadata, valves)
+        current = await self._current_source(snapshot, metadata, user, valves, emitter)
+        output, citations = chat_brief(snapshot, ref, citation_offset(metadata))
+        if (
+            not isinstance(current, str)
+            or hashlib.sha256(current.encode("utf-8")).hexdigest()
+            != snapshot["source_sha256"]
+        ):
+            output += "\n\nThe original source has changed. This brief uses the saved edition."
+        for p, unit in citations:
+            name = snapshot["filename"] + " · " + unit["id"]
+            await emitter(
+                {
+                    "type": "citation",
+                    "data": {
+                        "document": [unit["text"]],
+                        "metadata": [
+                            {
+                                "source": citation_key(snapshot, unit["id"]),
+                                "name": name,
+                                **self._citation_origin(snapshot),
+                                "passage_id": p["id"],
+                                "source_unit_id": unit["id"],
+                            }
+                        ],
+                        "source": {"name": name},
+                    },
+                }
+            )
+        await self._status(emitter, "Reading brief ready · no model calls", True)
+        return output
+
     async def _answer_question(self, ref, metadata, request, user, valves, emitter):
         from open_webui.models.chats import Chats
         from open_webui.models.files import Files
@@ -2545,25 +2887,7 @@ class Pipe:
             embeds[0], ref, metadata["chat_id"], valves.MAX_EMBED_BYTES
         )
         origin = snapshot.get("source_origin", {"kind": "file"})
-        if origin["kind"] == "file":
-            file = await Files.get_file_by_id(snapshot["file_id"])
-            if file is None or not (
-                file.user_id == user.id
-                or user.role == "admin"
-                or await has_access_to_file(snapshot["file_id"], "read", user)
-            ):
-                raise ReaderError(
-                    "The original document is unavailable or you no longer have access to it."
-                )
-            current = (file.data if isinstance(file.data, dict) else {}).get("content")
-        else:
-            _, current, _, current_origin, _ = await self._saved_input(
-                snapshot, metadata, user, valves, emitter
-            )
-            if current_origin != origin:
-                raise ReaderError(
-                    "The original input type or webpage reference changed. Prepare a new Reader from that input."
-                )
+        current = await self._current_source(snapshot, metadata, user, valves, emitter)
         context = passage_context(snapshot, ref["passage"])
         changed = (
             not isinstance(current, str)
@@ -2661,13 +2985,9 @@ class Pipe:
                             "document": [unit["text"]],
                             "metadata": [
                                 {
-                                    "source": uid,
+                                    "source": citation_key(snapshot, uid),
                                     "name": name,
-                                    **(
-                                        {"file_id": snapshot["file_id"]}
-                                        if origin["kind"] == "file"
-                                        else {"source_message_id": origin["message_id"]}
-                                    ),
+                                    **self._citation_origin(snapshot),
                                     "passage_id": unit["passage"],
                                     "source_unit_id": uid,
                                 }
@@ -2679,7 +2999,10 @@ class Pipe:
                 "- "
                 + markdown_text(point.text)
                 + " "
-                + "".join(f"[{cited.index(uid) + 1}]" for uid in point.evidence)
+                + "".join(
+                    f"[{citation_offset(metadata) + cited.index(uid) + 1}]"
+                    for uid in point.evidence
+                )
                 for point in answer.points
             )
         output += "\n\n*AI interpretation of the saved source passage and nearby context; inspect the citations for exact wording.*"
@@ -2725,9 +3048,6 @@ class Pipe:
                     "Use an ordinary saved chat that you own. Temporary chats and shared read-only chats cannot prepare a reader."
                 )
             valves = self.Valves.model_validate(self.valves.model_dump())
-            await self._validate_model(
-                __request__, user, valves.BASE_MODEL_ID.strip(), body.get("model")
-            )
             incoming = metadata.get("user_message")
             text = (
                 message_text(incoming.get("content"))
@@ -2743,6 +3063,14 @@ class Pipe:
                     ),
                     "",
                 )
+            brief = parse_brief(text, chat_id)
+            if brief is not None:
+                return await self._publish_brief(
+                    brief, metadata, user, valves, __event_emitter__
+                )
+            await self._validate_model(
+                __request__, user, valves.BASE_MODEL_ID.strip(), body.get("model")
+            )
             retry = parse_retry(text, chat_id)
             saved = (
                 await self._retry_snapshot(retry, metadata, valves) if retry else None

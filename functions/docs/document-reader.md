@@ -2,6 +2,8 @@
 
 Document Reader is an Open WebUI Pipe Function for reading one document at five levels: **Section map, Takeaways, Explanation, Extracts and Full text**. Paste text or Markdown, use **Attach Webpage**, or attach a DOCX, text-based PDF, TXT or Markdown file. Prepare it once, then change levels and inspect the source inside the saved response.
 
+Version **0.6.0** adds **Attach Notes**, local **Find** over the complete source, and **Send brief to chat**. These additions stay inside the Pipe Function and use existing OWUI note permissions, composer drafts and citation events. There are no new routes, dependencies or OWUI application changes. Regenerate an older Reader to obtain the new controls.
+
 The installable artifact is [document_reader.py](../document_reader.py). It uses Open WebUI's existing extraction, users, file permissions and configured models. It adds no routes, provider credentials, parser packages or database tables. The [PoC plan](document-reader-poc-plan.md) records the design and acceptance criteria.
 
 This package targets the current OWUI checkout, version 0.11.3. Earlier live verification covered 0.2.1, installed on 6 October 2026 after the 0.2.0 overview-first check. Recorded earlier PDF checks cover generation in 0.1.4, the responsive update in 0.1.5 and structured reading in 0.1.6. These checks do not establish compatibility with another deployment.
@@ -85,6 +87,8 @@ No provider key is entered in these Valves. The delegated call uses OWUI's exist
 
 ## Prepare and read a document
 
+**Attach Notes:** use OWUI's existing Attach Notes control and select one saved Note, then send “Prepare this document”. The Pipe reads the Note's current server-stored Markdown, ignoring title/content supplied in attachment metadata. It enforces OWUI's Notes feature permission and the Note's owner/admin/read-grant rules, including shared Notes. These checks run again for questions, retries and chat briefs. A changed Note can still be discussed or exported from the frozen Reader edition with a warning; retries require an unchanged source. Deleted or inaccessible Notes cannot be used for these operations. Reader never edits a Note.
+
 1. Start an ordinary **saved chat** and select the configured Document Reader entry. Temporary chats and API-only calls without the required message/embed context are not supported.
 2. Supply one source: paste text/Markdown directly into the message, use **Attach Webpage** and wait for processing, or attach one DOCX, PDF, TXT or Markdown file. For an attachment, send “Prepare this document” after processing completes. With no attachment, the **whole message is the source**, so omit instructions such as “summarise the following”.
 3. Wait for preparation status updates. Reader loads the source text and processes bounded batches. For passage questions, use **Ask about this passage** in the prepared Reader.
@@ -95,6 +99,8 @@ No provider key is entered in these Valves. The delegated call uses OWUI's exist
 
 ### Zoom, questions and reading briefs
 
+**Find** searches the complete saved source, including wording absent from the current compressed level and source-only passages. Search is literal and case-insensitive, tolerates differences in whitespace, and shows up to 100 matching snippets. Selecting a result jumps to Full text and opens Inspect source with the matching source units highlighted. Closing search without choosing a result keeps your reading level and place. Search stays within the iframe, makes no network/model calls and adds no global keyboard shortcut.
+
 Scroll over the level bar to step through detail, or drag horizontally and release on a level. The highlighted target previews the change. Vertical touch movement cancels the drag; Ctrl/Cmd-wheel remains available for browser zoom. There are no new keyboard shortcuts. Buttons keep their normal keyboard behaviour.
 
 At generated and extract levels, passage metadata compares the visible text's word count with its source. These are whitespace-based counts, useful for judging compression in prose rather than language-independent token counts. A level that is at least as long as the source says so; the Reader never truncates its content to force a shorter display.
@@ -104,6 +110,10 @@ At generated and extract levels, passage metadata compares the visible text's wo
 The Function answers from the selected saved passage and, when space permits, its immediate neighbours in the same section (12,000 source characters maximum). It checks chat ownership and model permission again. File-backed Readers also require current file access; pasted/webpage Readers require the original user message and matching input type/reference in that same chat. Answers use the saved edition, with a warning if its source text has since changed. The answer appears as ordinary chat Markdown with OWUI's existing source citations. It does not regenerate the Reader. An answer needs one model completion, with at most one additional repair for invalid JSON or citations. Unmarked follow-up questions do not inherit passage scope: use the passage control again. Regenerate older saved Readers to obtain the new controls and references.
 
 Use **Add to brief** on passages or in **Inspect source**. **Brief (N)** shows selected points in document order, with AI takeaways and supporting source wording; explanations are optional. Source-only passages retain their source text. Download UTF-8 Markdown, or copy/select the preview if downloads are blocked. Downloads preserve the source's line endings; the browser may normalise line endings when copying from its textarea. Source quotes use fenced code blocks so embedded markup remains inert. The brief is limited to 50 passages and 60,000 characters. Selections survive level changes and resizing, but reset when the Reader reloads; download the brief to retain it.
+
+**Send brief to chat** opens a request draft for the selected passages and the optional explanation setting. Use Replace chat draft (which replaces your current composer text) or Copy draft, close the dialog, and press the normal Send button with Document Reader selected. Nothing is submitted automatically. The backend checks ownership, source access and the saved reference, validates each generated point's evidence, and rebuilds the response from the saved edition. It never accepts client-supplied brief prose or calls a model. A generation model need not remain available to export already-prepared text.
+
+The resulting ordinary assistant response supports OWUI's Copy, Read Aloud and chat export controls. Native citations carry the exact supporting source; source-only points are quoted in inert code fences. The chat brief is limited to 50 passages and 60,000 characters including cited source text. Use OWUI Notes to edit or export the resulting brief: copy it to a Note, or use Insert into note when working in the Notes chat context. The Pipe does not create or overwrite Notes automatically.
 
 Use one document per chat during this PoC. Reader selects an explicit current-message attachment before considering the message text, or uses the corresponding stored user message when regenerating. Inherited chat/project files and Knowledge collections are not selected. Multiple or unsupported attachments receive a selection error.
 
@@ -263,3 +273,11 @@ A live report on 6 October 2026 exposed an inspector feedback defect: two cited 
 The selected evidence now has a distinct background and underline. Other cited units remain highlighted, and the location label states **Evidence N of M**. Complete extracted passage text remains unchanged, including its whitespace. The same-passage regression scenario failed before the fix and passes afterward; all 98 focused Reader checks pass.
 
 Function 0.2.1 was saved through the live editor with exact local-source verification and existing Valves retained. The Guidelines response regenerated with 15/15 batches in 15 calls and 28,014 source characters. Live switching between Evidence 1 and Evidence 2 moved the selected underline between the approval-conditions sentence and the individual-responsibility sentence; the location label also changed. The inspector was left open with Evidence 2 selected for review. Earlier saved responses retain their old embedded interface.
+
+### Recorded live Notes, search and brief check — 7 October 2026
+
+Function 0.6.0 was installed through the OWUI editor with existing Valves retained. The saved code was reloaded and its Python syntax tree matched the local source. No OWUI application changes were required. The focused suite passed **173 tests**, including isolated-frame browser checks, Note permissions, malformed references and source-citation numbering.
+
+A synthetic OWUI Note prepared all three batches and six source passages. Find located wording hidden at the overview level and displayed the correct passage number. Sending a selected reading brief through the normal chat draft and Send controls returned an ordinary cited response with zero model calls. OWUI's source viewer opened the exact supporting sentence; citation numbering accounts for sources that OWUI inserts before the Pipe's evidence. Retrying the saved Note Reader reused all three batches with zero new model calls.
+
+These live checks used an administrator account. Shared, revoked and deleted Note access scenarios are covered by local tests; live ordinary-user acceptance remains outstanding. Previously saved Readers retain their embedded interface and need regeneration to expose the new controls.
