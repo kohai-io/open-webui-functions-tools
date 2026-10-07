@@ -37,6 +37,12 @@ def prepare(mounted):
     frame.get_by_role("button", name="Explanation", exact=True).click()
     goto_passage(frame, "p0012", offset=20)
     page.emulate_media(reduced_motion="no-preference")
+    # Chromium dispatches the matchMedia change asynchronously. Let the Reader's
+    # legitimate preference-change cancellation finish before starting the motion
+    # we intend to inspect, otherwise it can cancel the paused test animation.
+    frame.locator("body").evaluate(
+        "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+    )
     return page, frame
 
 
