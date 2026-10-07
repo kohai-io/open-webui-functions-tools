@@ -1,8 +1,8 @@
 """
 title: Document Reader
 author: Document Reader contributors
-version: 0.4.0
-description: Five linked reading levels for an attached DOCX, text PDF or Markdown document. Uses OWUI extraction and saves an interactive reader in the chat.
+version: 0.5.0
+description: Five linked reading levels for pasted text, Markdown, an attached webpage or document. Uses OWUI extraction and saves an interactive reader in the chat.
 required_open_webui_version: 0.11.3
 license: MIT
 """
@@ -27,10 +27,10 @@ SEGMENTATION_VERSION = "4"
 PROMPT_VERSION = "2"
 SCHEMA_VERSION = 1
 PRIVACY_NOTICE = (
-    "This reader is saved in the chat and contains the full extracted document. "
+    "This reader is saved in the chat and contains the full source document. "
     "Sharing or exporting the chat may disclose that text."
 )
-SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".md", ".markdown"}
+SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".md", ".markdown", ".txt"}
 
 
 class ReaderError(ValueError):
@@ -370,11 +370,11 @@ def build_snapshot(
 ) -> dict:
     if not isinstance(text, str) or not text.strip():
         raise ReaderError(
-            "OWUI has no usable extracted text for this document. Check file processing first."
+            "There is no usable text for this document. Paste its text or check attachment processing first."
         )
     if len(text) > valves.MAX_SOURCE_CHARS:
         raise ReaderError(
-            f"The extracted document exceeds the {valves.MAX_SOURCE_CHARS:,}-character Reader limit. Use a smaller document."
+            f"The source document exceeds the {valves.MAX_SOURCE_CHARS:,}-character Reader limit. Use a smaller document."
         )
     soft_limit = min(2400, valves.MAX_BATCH_SOURCE_CHARS)
     furniture = _page_furniture(text, filename)
@@ -456,7 +456,7 @@ def build_snapshot(
         section["passage_ids"].append(passage_id)
         if len(snapshot["passages"]) > valves.MAX_PASSAGES:
             raise ReaderError(
-                f"The extracted document still exceeds the {valves.MAX_PASSAGES}-passage Reader limit after grouping adjacent prose ({len(text):,} characters). Separate headings and table blocks are kept apart. Review the Reader limits or use a shorter section; no text was truncated."
+                f"The source document still exceeds the {valves.MAX_PASSAGES}-passage Reader limit after grouping adjacent prose ({len(text):,} characters). Separate headings and table blocks are kept apart. Review the Reader limits or use a shorter section; no text was truncated."
             )
 
     # PDF extractors can insert a blank line after every visual line. Pack
@@ -922,11 +922,20 @@ def question_snapshot(
             or s.get("fingerprint") != ref["fingerprint"]
         ):
             raise ValueError()
-        if (
-            not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", s["file_id"])
-            or not isinstance(s["filename"], str)
-            or len(s["filename"]) > 1000
+        origin = s.get("source_origin", {"kind": "file"})
+        if not isinstance(origin, dict) or origin.get("kind") not in (
+            "file",
+            "paste",
+            "text",
+            "web",
         ):
+            raise ValueError()
+        if origin["kind"] == "file":
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", s["file_id"]):
+                raise ValueError()
+        elif not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", origin.get("message_id", "")):
+            raise ValueError()
+        if not isinstance(s["filename"], str) or len(s["filename"]) > 1000:
             raise ValueError()
         if (
             not isinstance(s["sections"], list)
@@ -1107,9 +1116,9 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
 <dialog id="retry-dialog" aria-labelledby="retry-title"><div class="dialog-shell"><header class="dialog-header"><h2 id="retry-title">Retry missing sections</h2><button class="close" aria-label="Close retry" data-close="retry-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Reuse the prepared sections and try the missing ones again. This creates a new Reader in chat. The source, model and preparation settings must still match.</p><p class="dialog-description">Replace chat draft replaces any current draft. Check it in chat and send with Document Reader selected. If the composer hook is unavailable, copy and paste the draft.</p><label class="field-label" for="retry-draft">Retry draft</label><textarea id="retry-draft" class="bookmark-text" readonly spellcheck="false"></textarea><p id="retry-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="retry-replace">Replace chat draft</button><button id="retry-copy" class="primary">Copy retry</button></footer></div></dialog>
 <dialog id="question-dialog" aria-labelledby="question-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Saved passage</div><h2 id="question-title">Ask about this passage</h2></div><button class="close" aria-label="Close question" data-close="question-dialog">×</button></header><div class="dialog-body"><p id="question-location" class="dialog-description"></p><label class="field-label" for="question-input">Your question</label><textarea id="question-input" class="question-field" maxlength="2000" placeholder="What do you want to understand?"></textarea><div id="question-presets" class="question-presets"></div><details class="source-preview"><summary>Source context</summary><div id="question-source" class="source-text"></div></details><p class="dialog-description">Copy the draft below, paste it into chat and send with Document Reader selected. It includes a reference to this saved passage. Replace chat draft uses OWUI's existing composer hook and replaces any current draft; you still press Send.</p><label class="field-label" for="question-draft">Question draft</label><textarea id="question-draft" class="bookmark-text" readonly spellcheck="false"></textarea><p id="question-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="question-replace">Replace chat draft</button><button id="question-copy" class="primary">Copy question</button></footer></div></dialog>
 <dialog id="brief-dialog" aria-labelledby="brief-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Reading brief</div><h2 id="brief-title">Keep the useful points</h2></div><button class="close" aria-label="Close brief" data-close="brief-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Takeaways with supporting source wording. Add passages as you read, then download to keep this brief. Selections reset when this Reader is reopened.</p><p id="brief-empty" class="empty">Nothing selected yet. Use Add to brief on a passage or in Inspect source.</p><ul id="brief-list" class="brief-list"></ul><label><input id="brief-explanations" type="checkbox"> Include AI explanations</label><p id="brief-error" class="error" role="alert" hidden></p><label class="field-label" for="brief-preview">Markdown preview</label><textarea id="brief-preview" class="bookmark-text" readonly spellcheck="false"></textarea><p id="brief-feedback" class="dialog-description" role="status"></p></div><footer class="dialog-footer"><button id="brief-copy">Copy brief</button><button id="brief-download" class="primary">Download Markdown</button></footer></div></dialog>
-<dialog id="source-dialog" aria-labelledby="source-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Verbatim evidence</div><h2 id="source-title">Source wording</h2></div><button class="close" aria-label="Close source" data-close="source-dialog">×</button></header><div class="dialog-body" id="source-body"><p class="dialog-description">Exact OWUI-extracted text. The original file’s layout may differ. Cited text is highlighted. The selected evidence is underlined.</p><div id="source-citations" class="citation-list" role="group" aria-label="Cited source units"></div><p id="source-location" class="source-location"></p><div id="source-text" class="source-text"></div></div><footer class="dialog-footer"><button id="source-previous">← Previous passage</button><span id="source-count" class="quiet"></span><button id="source-next">Next passage →</button></footer></div></dialog>
+<dialog id="source-dialog" aria-labelledby="source-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Verbatim evidence</div><h2 id="source-title">Source wording</h2></div><button class="close" aria-label="Close source" data-close="source-dialog">×</button></header><div class="dialog-body" id="source-body"><p class="dialog-description">Exact saved source text. Extracted files and webpages may differ from their original layout. Cited text is highlighted. The selected evidence is underlined.</p><div id="source-citations" class="citation-list" role="group" aria-label="Cited source units"></div><p id="source-location" class="source-location"></p><div id="source-text" class="source-text"></div></div><footer class="dialog-footer"><button id="source-previous">← Previous passage</button><span id="source-count" class="quiet"></span><button id="source-next">Next passage →</button></footer></div></dialog>
 <dialog id="bookmark-dialog" aria-labelledby="bookmark-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Manual bookmark</div><h2 id="bookmark-title">Save your place</h2></div><button class="close" aria-label="Close bookmark" data-close="bookmark-dialog">×</button></header><div class="dialog-body"><p id="bookmark-description" class="dialog-description"></p><label class="field-label" for="bookmark-text">Bookmark token</label><textarea id="bookmark-text" class="bookmark-text" spellcheck="false" autocomplete="off"></textarea><p id="bookmark-error" class="error" role="alert" hidden></p></div><footer class="dialog-footer"><span class="quiet">Contains your position, not document text.</span><button id="bookmark-action" class="primary"></button></footer></div></dialog>
-<dialog id="info-dialog" aria-labelledby="info-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Saved snapshot</div><h2 id="info-title">About this reader</h2></div><button class="close" aria-label="Close information" data-close="info-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Full text and extracts use the text supplied by Open WebUI. Explanations, takeaways and overviews are AI generated: inspect the source to check their meaning.</p><div id="snapshot-details"></div><p class="info-privacy">This reader is saved in the chat and contains the full extracted document. Sharing or exporting the chat may disclose that text. Removing access to the original file does not remove this saved copy.</p><p class="dialog-description">Start with the section map and explore source-linked key concepts. Reading controls work locally. Your reading level and position are saved on this browser when storage is available. Save place provides an optional portable bookmark; the footer reports whether automatic saving is supported.</p><p class="dialog-description">To prepare the document again, rerun Document Reader in chat with the intended file attached. This creates a new snapshot and may regenerate every passage; this saved reader does not update in the background.</p></div></div></dialog>
+<dialog id="info-dialog" aria-labelledby="info-title"><div class="dialog-shell"><header class="dialog-header"><div><div class="eyebrow quiet">Saved snapshot</div><h2 id="info-title">About this reader</h2></div><button class="close" aria-label="Close information" data-close="info-dialog">×</button></header><div class="dialog-body"><p class="dialog-description">Full text and extracts use your pasted text or the extraction supplied by Open WebUI. Explanations, takeaways and overviews are AI generated: inspect the source to check their meaning.</p><div id="snapshot-details"></div><p class="info-privacy">This reader is saved in the chat and contains the full source document. Sharing or exporting the chat may disclose that text. Removing the original input or its access does not remove this saved copy.</p><p class="dialog-description">Start with the section map and explore source-linked key concepts. Reading controls work locally. Your reading level and position are saved on this browser when storage is available. Save place provides an optional portable bookmark; the footer reports whether automatic saving is supported.</p><p class="dialog-description">To prepare the document again, paste its text or attach the intended file or webpage in chat. This creates a new snapshot and may regenerate every passage; this saved reader does not update in the background.</p></div></div></dialog>
 <script id="reader-data" type="application/json">__READER_DATA__</script>
 <script>
 (() => {
@@ -1433,7 +1442,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
       quotes.forEach(u=>quoteIds.add(u.id));entries.push({p,items,quotes});
     });
     const quoted=data.passages.flatMap(p=>p.units).filter(u=>quoteIds.has(u.id)),numbers=new Map(quoted.map((u,i)=>[u.id,i+1]));
-    const out=['# Reading brief: '+markdownEscape(data.filename),'Saved edition prepared: '+markdownEscape(data.created_at||'Not recorded'),'AI takeaways and explanations are interpretations. Source wording is copied from OWUI extraction; original layout may differ.'];
+    const out=['# Reading brief: '+markdownEscape(data.filename),'Saved edition prepared: '+markdownEscape(data.created_at||'Not recorded'),'AI takeaways and explanations are interpretations. Source wording is copied from the saved input; extracted layout may differ.'];
     if(data.status==='partial')out.push('Some document levels were not prepared. Selected source-only passages are included below.');
     let current=null;
     entries.forEach(({p,items,quotes},i)=>{
@@ -1515,7 +1524,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     let provenance=raw?'Extracted source':(state.level==='extracts'?'Verbatim source':'AI generated');
     if(p.source_only||!p.generated)provenance=heading?'Source heading':'Extracted source';
     const meta=el('div','passage-meta');meta.append(el('span','passage-index',String(p.index+1).padStart(2,'0')),el('span','provenance',provenance));article.append(meta);
-    if(expanded && state.level!=='full')article.append(el('div','expanded-label','Expanded passage · full extracted text'));
+    if(expanded && state.level!=='full')article.append(el('div','expanded-label','Expanded passage · full source text'));
     if(!raw && !heading && (p.source_only||!p.generated))article.append(el('div','fallback-reason'+(p.source_only?' source-only-note':''),p.source_only ? 'Source only · '+(p.reason||'This passage is preserved without AI interpretation.') : 'AI level unavailable · '+(p.error||'This passage was not prepared. Source text is shown below.')));
     if(!raw&&(p.reason==='Document cover'||p.reason==='Contents listing'))article.append(el('p','empty',p.reason==='Document cover'?'Cover material is preserved in Full text and Inspect source.':'Use the section map to navigate; the original contents listing is preserved in Full text and Inspect source.'));
     else if(raw||p.source_only||!p.generated){const text=el('div','source-text');appendReading(text,p);article.append(text);}
@@ -1646,6 +1655,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   $('snapshot-status').textContent=data.status==='partial'?'Partly prepared':'Ready to read';$('snapshot-status').classList.toggle('partial',data.status==='partial');
   $('coverage-note').textContent=data.status==='partial'?'Some explanations are unavailable':data.sections.filter(s=>!isFront(s)).length+' sections';$('coverage-note').classList.toggle('partial-note',data.status==='partial');
   const details=el('dl','snapshot-meta');[['Document',data.filename],['Model',data.model_id],['Prepared',data.created_at],['Coverage',data.status==='partial'?'Partial snapshot':'Prepared snapshot']].forEach(([key,value])=>{details.append(el('dt','',key),el('dd','',value||'Not recorded'));});$('snapshot-details').append(details);
+  const origin=data.source_origin||{kind:'file'};const originLabel={file:'Attached file · OWUI extraction',paste:'Pasted text / Markdown',text:'Attached text',web:'Attached webpage · saved OWUI extraction'}[origin.kind]||'Saved source';$('snapshot-details').append(el('p','',originLabel));if(origin.url)$('snapshot-details').append(el('p','',origin.url));
   if(data.generation){const g=data.generation;$('snapshot-details').append(el('p','',g.completed_batches+' of '+g.total_batches+' batches prepared · '+(g.reused_batches||0)+' reused · '+g.calls+' new model calls.'));}
   if((data.warnings||[]).length){const list=el('ul','detail-list');data.warnings.forEach(w=>list.append(el('li','',w)));$('snapshot-details').append(el('h3','eyebrow','Preparation notes'),list);}
   (data.extraction_metadata||[]).forEach(note=>{const n=el('aside','source-metadata');n.append(el('div','eyebrow quiet','Document edition · extracted footer'),el('p','',note.text),evidenceButton(note.evidence,units.get(note.evidence[0])?.passageId));$('snapshot-details').append(n);});
@@ -1740,6 +1750,143 @@ class Pipe:
                 pass
 
     @staticmethod
+    async def _input_message(metadata):
+        message = metadata.get("user_message")
+        if not isinstance(message, dict) or not (
+            "files" in message or "content" in message
+        ):
+            from open_webui.models.chats import Chats
+
+            mid = metadata.get("user_message_id")
+            message = (
+                await Chats.get_message_by_id_and_message_id(metadata["chat_id"], mid)
+                if mid
+                else None
+            )
+        if not isinstance(message, dict) or message.get("role", "user") != "user":
+            raise ReaderError(
+                "Paste text or Markdown, or attach one document or webpage to the current message. Inherited chat/project inputs are not selected automatically."
+            )
+        return message
+
+    async def _load_input(self, metadata, user, valves, emitter):
+        message = await self._input_message(metadata)
+        attachments = message.get("files", [])
+        if attachments is None:
+            attachments = []
+        if not isinstance(attachments, list):
+            raise ReaderError(
+                "The current message has invalid attachments. Attach one document or webpage again."
+            )
+        if attachments and all(
+            isinstance(a, dict) and a.get("type", "file") == "file" for a in attachments
+        ):
+            file_id = await self._select_file(
+                {**metadata, "user_message": message}, user
+            )
+            file, text, warnings = await self._load_source(
+                file_id, user, valves, emitter
+            )
+            return file.filename, text, file_id, {"kind": "file"}, warnings
+        mid = message.get("id") or metadata.get("user_message_id")
+        if not isinstance(mid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", mid):
+            raise ReaderError(
+                "Save this input in an ordinary chat before preparing a Reader."
+            )
+        if attachments:
+            if len(attachments) != 1 or not isinstance(attachments[0], dict):
+                raise ReaderError("Attach exactly one document or webpage per Reader.")
+            item = attachments[0]
+            if item.get("type") not in ("text", "web"):
+                raise ReaderError(
+                    "Attach one document or webpage, not images, folders or Knowledge collections."
+                )
+            nested = item.get("file") if isinstance(item.get("file"), dict) else {}
+            data = nested.get("data") if isinstance(nested.get("data"), dict) else {}
+            meta = nested.get("meta") if isinstance(nested.get("meta"), dict) else {}
+            text = data.get("content")
+            if (
+                item.get("status")
+                in ("uploading", "processing", "pending", "error", "failed")
+                or not isinstance(text, str)
+                or not text.strip()
+            ):
+                raise ReaderError(
+                    "OWUI has not supplied usable webpage/text content. Finish Attach Webpage processing or paste the page text instead. Collection names and bare URLs are not document text."
+                )
+            url = meta.get("source") or item.get("url")
+            try:
+                parsed_url = urlsplit(url) if isinstance(url, str) else None
+                is_web = bool(
+                    parsed_url
+                    and parsed_url.scheme in ("http", "https")
+                    and parsed_url.hostname
+                )
+            except ValueError:
+                parsed_url, is_web = None, False
+            name = str(
+                meta.get("name")
+                or item.get("name")
+                or ("Attached webpage" if is_web else "Attached text")
+            )[:1000]
+            origin = {"kind": "web" if is_web else "text", "message_id": mid}
+            # The URL is descriptive provenance only; never a fetch instruction.
+            if (
+                is_web
+                and len(url) <= 2000
+                and not parsed_url.username
+                and not parsed_url.password
+            ):
+                origin["url"] = url
+        else:
+            text = message_text(message.get("content"))
+            if re.fullmatch(r"\s*https?://\S+\s*", text):
+                raise ReaderError(
+                    "Use Attach Webpage for a URL, or paste its text. Document Reader does not fetch bare links."
+                )
+            if not text.strip() or re.fullmatch(
+                r"\s*(?:please\s+)?(?:prepare|read|summari[sz]e)(?: this)?(?: document| text| file)?[.!]?\s*",
+                text,
+                re.I,
+            ):
+                raise ReaderError(
+                    "Paste the document text or Markdown directly, or attach one document/webpage before sending. With no attachment, the whole message becomes the source document."
+                )
+            heading = re.search(r"^#{1,6}\s+(.+)$", text, re.M)
+            name = (
+                heading.group(1).strip()[:120] if heading else "Pasted text"
+            ) + ".md"
+            origin = {"kind": "paste", "message_id": mid}
+        return name, text, "", origin, []
+
+    async def _saved_input(self, snapshot, metadata, user, valves, emitter):
+        origin = snapshot.get("source_origin", {"kind": "file"})
+        if origin["kind"] == "file":
+            file, text, warnings = await self._load_source(
+                snapshot["file_id"], user, valves, emitter
+            )
+            return file.filename, text, snapshot["file_id"], origin, warnings
+        from open_webui.models.chats import Chats
+
+        message = await Chats.get_message_by_id_and_message_id(
+            metadata["chat_id"], origin["message_id"]
+        )
+        if not isinstance(message, dict) or message.get("role") != "user":
+            raise ReaderError(
+                "The original pasted text or webpage attachment is unavailable in this chat. Paste or attach it again to prepare a new Reader."
+            )
+        return await self._load_input(
+            {
+                "chat_id": metadata["chat_id"],
+                "user_message_id": origin["message_id"],
+                "user_message": message,
+            },
+            user,
+            valves,
+            emitter,
+        )
+
+    @staticmethod
     async def _select_file(metadata: dict, user) -> str:
         message = metadata.get("user_message")
         if not isinstance(message, dict) or "files" not in message:
@@ -1753,18 +1900,18 @@ class Pipe:
                 )
         if not isinstance(message, dict) or message.get("role", "user") != "user":
             raise ReaderError(
-                "Attach one DOCX, PDF or Markdown document to the current message. Inherited chat/project files are not selected automatically."
+                "Attach one DOCX, PDF, TXT or Markdown document to the current message. Inherited chat/project files are not selected automatically."
             )
         attachments = message.get("files")
         if not isinstance(attachments, list) or not attachments:
             raise ReaderError(
-                "Attach one DOCX, PDF or Markdown document to the current message."
+                "Attach one DOCX, PDF, TXT or Markdown document to the current message."
             )
         ids = set()
         for item in attachments:
             if not isinstance(item, dict) or item.get("type", "file") != "file":
                 raise ReaderError(
-                    "Attach one individual DOCX, PDF or Markdown file, not images, folders or Knowledge collections."
+                    "Attach one individual DOCX, PDF, TXT or Markdown file, not images, folders or Knowledge collections."
                 )
             nested = item.get("file") if isinstance(item.get("file"), dict) else {}
             file_id = item.get("id") or nested.get("id")
@@ -1808,7 +1955,7 @@ class Pipe:
                 not in SUPPORTED_EXTENSIONS
             ):
                 raise ReaderError(
-                    "Document Reader supports DOCX, text-based PDF and Markdown files."
+                    "Document Reader supports DOCX, text-based PDF, Markdown and TXT files."
                 )
             data = file.data if isinstance(file.data, dict) else {}
             content = data.get("content")
@@ -2397,17 +2544,27 @@ class Pipe:
         snapshot = question_snapshot(
             embeds[0], ref, metadata["chat_id"], valves.MAX_EMBED_BYTES
         )
-        file = await Files.get_file_by_id(snapshot["file_id"])
-        if file is None or not (
-            file.user_id == user.id
-            or user.role == "admin"
-            or await has_access_to_file(snapshot["file_id"], "read", user)
-        ):
-            raise ReaderError(
-                "The original document is unavailable or you no longer have access to it."
+        origin = snapshot.get("source_origin", {"kind": "file"})
+        if origin["kind"] == "file":
+            file = await Files.get_file_by_id(snapshot["file_id"])
+            if file is None or not (
+                file.user_id == user.id
+                or user.role == "admin"
+                or await has_access_to_file(snapshot["file_id"], "read", user)
+            ):
+                raise ReaderError(
+                    "The original document is unavailable or you no longer have access to it."
+                )
+            current = (file.data if isinstance(file.data, dict) else {}).get("content")
+        else:
+            _, current, _, current_origin, _ = await self._saved_input(
+                snapshot, metadata, user, valves, emitter
             )
+            if current_origin != origin:
+                raise ReaderError(
+                    "The original input type or webpage reference changed. Prepare a new Reader from that input."
+                )
         context = passage_context(snapshot, ref["passage"])
-        current = (file.data if isinstance(file.data, dict) else {}).get("content")
         changed = (
             not isinstance(current, str)
             or hashlib.sha256(current.encode("utf-8")).hexdigest()
@@ -2506,7 +2663,11 @@ class Pipe:
                                 {
                                     "source": uid,
                                     "name": name,
-                                    "file_id": snapshot["file_id"],
+                                    **(
+                                        {"file_id": snapshot["file_id"]}
+                                        if origin["kind"] == "file"
+                                        else {"source_message_id": origin["message_id"]}
+                                    ),
                                     "passage_id": unit["passage"],
                                     "source_unit_id": uid,
                                 }
@@ -2521,7 +2682,7 @@ class Pipe:
                 + "".join(f"[{cited.index(uid) + 1}]" for uid in point.evidence)
                 for point in answer.points
             )
-        output += "\n\n*AI interpretation of the saved extracted passage and nearby context; inspect the citations for exact wording.*"
+        output += "\n\n*AI interpretation of the saved source passage and nearby context; inspect the citations for exact wording.*"
         if changed:
             output += "\n\nThe current extraction differs or is unavailable. This answer concerns the saved edition; prepare a new Reader to use updated text."
         await self._status(emitter, "Passage answer ready", True)
@@ -2551,7 +2712,7 @@ class Pipe:
                 or __request__ is None
             ):
                 raise ReaderError(
-                    "Use Document Reader in an ordinary saved OWUI chat with one attached document. Temporary chats and API-only calls are not supported."
+                    "Use Document Reader in an ordinary saved OWUI chat with pasted text or one attached document/webpage. Temporary chats and API-only calls are not supported."
                 )
             from open_webui.models.users import Users
             from open_webui.models.chats import Chats
@@ -2591,20 +2752,19 @@ class Pipe:
                 return await self._answer_question(
                     question, metadata, __request__, user, valves, __event_emitter__
                 )
-            file_id = (
-                saved["file_id"]
-                if saved is not None
-                else await self._select_file(metadata, user)
-            )
-            await self._status(
-                __event_emitter__, "Loading OWUI's extracted document text…"
-            )
-            file, source, warnings = await self._load_source(
-                file_id, user, valves, __event_emitter__
-            )
+            await self._status(__event_emitter__, "Loading the document source…")
+            if saved is not None:
+                filename, source, file_id, origin, warnings = await self._saved_input(
+                    saved, metadata, user, valves, __event_emitter__
+                )
+            else:
+                filename, source, file_id, origin, warnings = await self._load_input(
+                    metadata, user, valves, __event_emitter__
+                )
             snapshot = build_snapshot(
-                source, file.filename, file_id, valves.BASE_MODEL_ID.strip(), valves
+                source, filename, file_id, valves.BASE_MODEL_ID.strip(), valves
             )
+            snapshot["source_origin"] = origin
             snapshot["reader_chat_id"] = chat_id
             snapshot["reader_message_id"] = metadata["message_id"]
             snapshot["source_sha256"] = hashlib.sha256(
@@ -2624,6 +2784,7 @@ class Pipe:
                     != snapshot["preparation_identity"]
                     or saved.get("source_sha256") != snapshot["source_sha256"]
                     or saved.get("sections") != snapshot["sections"]
+                    or saved.get("source_origin", {"kind": "file"}) != origin
                 ):
                     raise ReaderError(
                         "The source, model or preparation settings have changed. Attach the document and prepare a new Reader instead of retrying this edition."
