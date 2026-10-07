@@ -101,7 +101,9 @@ def reader_snapshot():
         passages.append(passage)
     return {
         "version": 1,
-        "fingerprint": "fixture-source-sha256-segmentation-1",
+        "fingerprint": "a" * 64,
+        "reader_chat_id": "saved-reader-chat",
+        "reader_message_id": "saved-reader",
         "filename": "Customer support pilot — decision brief.docx",
         "model_id": "permitted-test-model",
         "created_at": "2026-10-05T12:00:00Z",
