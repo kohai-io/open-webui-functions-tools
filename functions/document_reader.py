@@ -1433,7 +1433,8 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   ['wheel','touchstart','pointerdown','keydown'].forEach(type=>scroller.addEventListener(type,stopZoom,{passive:true}));
   // Explicit search navigation stays anchored when a short document or its end
   // cannot scroll the chosen passage to the top. Manual reading releases it.
-  ['wheel','touchstart','pointerdown','keydown'].forEach(type=>scroller.addEventListener(type,()=>{readingTarget=null;},{passive:true}));
+  ['wheel','touchstart','pointerdown'].forEach(type=>scroller.addEventListener(type,()=>{readingTarget=null;},{passive:true}));
+  scroller.addEventListener('keydown',event=>{if(['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key))readingTarget=null;});
   document.addEventListener('visibilitychange',()=>{if(document.hidden)stopZoom();});
   function showDialog(id, trigger) { dialogTriggers.set(id,trigger || document.activeElement); $(id).showModal(); }
   document.querySelectorAll('[data-close]').forEach(n => n.addEventListener('click',() => $(n.dataset.close).close()));

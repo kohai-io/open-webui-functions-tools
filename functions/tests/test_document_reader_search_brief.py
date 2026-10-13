@@ -207,6 +207,8 @@ def test_found_passage_stays_selected_when_document_is_too_short_to_scroll(
     frame.locator("#search-dialog").get_by_role(
         "button", name="Open in reader", exact=True
     ).click()
+    # Moving focus back towards the level bar must not count as manual scrolling.
+    frame.locator("#passage-p0003").press("Shift+Tab")
     for level in ("Extracts", "Explanation", "Takeaways", "Section map", "Full text"):
         frame.get_by_role("button", name=level, exact=True).click()
         assert frame.locator("#position").get_attribute("data-passage") == "p0003"
