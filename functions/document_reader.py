@@ -1,7 +1,7 @@
 """
 title: Document Reader
 author: Document Reader contributors
-version: 0.6.0
+version: 0.6.1
 description: Five linked reading levels for text, Markdown, documents, webpages and OWUI Notes. Search the source, ask passage questions and send a reading brief to chat.
 required_open_webui_version: 0.11.3
 license: MIT
@@ -1287,7 +1287,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
 .source-unit.selected-evidence{background:var(--wash);text-decoration:underline;text-decoration-color:var(--accent);text-decoration-thickness:2px;text-underline-offset:3px;box-decoration-break:clone;-webkit-box-decoration-break:clone}
 .zoom-layer{position:absolute;left:0;overflow:hidden;pointer-events:none;user-select:none;contain:strict;z-index:2}.zoom-word{position:absolute;white-space:pre;transform-origin:0 0;pointer-events:none}.reading-content.zooming .source-text,.reading-content.zooming .generated-text,.reading-content.zooming .section-title{opacity:0}
 .level-bar{flex-wrap:wrap;gap:8px 20px}.levels{touch-action:pan-y}.level-hint{flex-basis:100%;font-size:10px;color:var(--muted);margin-left:96px}.level[data-zoom-target=true]{outline:2px dashed var(--accent);outline-offset:1px}.header-actions{flex-wrap:wrap}.brief-toggle[aria-pressed=true]{font-weight:600}.brief-list{padding:0;list-style:none}.brief-list li{display:flex;align-items:flex-start;gap:12px;padding:10px 0;border-bottom:1px solid var(--line)}.brief-list li span{flex:1;min-width:0;overflow-wrap:anywhere}.brief-list button{flex-shrink:0;font-size:11px}.question-field{width:100%;min-height:85px;padding:10px;border:1px solid var(--line);border-radius:6px;background:var(--paper);resize:vertical}.question-presets{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}.question-presets button{font-size:11px}.source-preview{margin:12px 0}.source-preview .source-text{max-height:150px;overflow:auto;font-size:13px}.dialog-footer{flex-wrap:wrap}#brief-preview{min-height:200px}#brief-button{font-size:12px}@media(max-width:650px){.level-hint{margin-left:0}.header-actions{justify-content:flex-end}.level-bar{gap:7px}.levels{flex-basis:100%}.header-actions #brief-button{font-size:11px}.dialog-footer{gap:8px}}
-.search-results{display:grid;gap:8px}.search-result{text-align:left;white-space:normal;padding:12px;font-size:13px;line-height:1.6}.search-result strong{display:block;font-size:11px;color:var(--muted)}.search-result mark{background:var(--source);color:var(--ink)}#search-input{width:100%;min-height:42px;margin-bottom:12px}#brief-dialog .dialog-footer{flex-wrap:wrap}
+.search-results{display:grid;gap:8px}.search-result{text-align:left;white-space:normal;padding:12px;font-size:13px;line-height:1.6;border:1px solid var(--line);border-radius:8px;overflow-wrap:anywhere}.search-result strong{display:block;font-size:11px;color:var(--muted)}.search-result mark{background:var(--source);color:var(--ink)}.search-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.search-actions button{font-size:12px}#search-input{width:100%;min-height:42px;margin-bottom:12px}#brief-dialog .dialog-footer{flex-wrap:wrap}
 </style>
 </head>
 <body>
@@ -1347,7 +1347,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   const meaningful=p=>!['Section heading','Source spacing','Extraction furniture'].includes(p.reason);
   const sectionWords=s=>s.passage_ids.flatMap(id=>passages.get(id)?.units||[]).filter(u=>!u.excluded).map(u=>u.text).join('').trim().split(/\s+/).length;
   let layoutAnchor=null, layoutWidth=innerWidth, layoutHeight=innerHeight, resizePending=false, resizeFrame=0;
-  let sourceIndex = 0, sourceEvidence = [], sourceSelected = null, bookmarkMode = 'save';
+  let sourceIndex = 0, sourceEvidence = [], sourceSelected = null, bookmarkMode = 'save', readingTarget = null;
   const dialogTriggers = new Map();
   const briefSelection=new Set();let questionPassage=null;
   const announce = text => { $('reader-announcement').textContent = text; };
@@ -1431,6 +1431,9 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   }
   motionPreference.addEventListener?.('change',stopZoom);
   ['wheel','touchstart','pointerdown','keydown'].forEach(type=>scroller.addEventListener(type,stopZoom,{passive:true}));
+  // Explicit search navigation stays anchored when a short document or its end
+  // cannot scroll the chosen passage to the top. Manual reading releases it.
+  ['wheel','touchstart','pointerdown','keydown'].forEach(type=>scroller.addEventListener(type,()=>{readingTarget=null;},{passive:true}));
   document.addEventListener('visibilitychange',()=>{if(document.hidden)stopZoom();});
   function showDialog(id, trigger) { dialogTriggers.set(id,trigger || document.activeElement); $(id).showModal(); }
   document.querySelectorAll('[data-close]').forEach(n => n.addEventListener('click',() => $(n.dataset.close).close()));
@@ -1439,6 +1442,8 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     if (state.level === 'map') return state.mapReturn || {id:state.active,offset:16};
     if(layoutAnchor?.kind==='passage'&&(resizePending||layoutWidth!==innerWidth||layoutHeight!==innerHeight))return layoutAnchor;
     const top=scroller.getBoundingClientRect().top, line=top+24;
+    const target=readingTarget&&$('passage-'+readingTarget);
+    if(target&&target.getBoundingClientRect().bottom>top&&target.getBoundingClientRect().top<top+scroller.clientHeight)return {id:readingTarget,offset:target.getBoundingClientRect().top-top};
     const focused=document.activeElement && document.activeElement.closest('[data-passage]');
     let selected=focused && focused.getBoundingClientRect().bottom>line && focused.getBoundingClientRect().top<top+scroller.clientHeight ? focused : null;
     if (!selected) selected=Array.from(content.querySelectorAll('[data-passage]')).find(n => n.getBoundingClientRect().bottom>line);
@@ -1534,6 +1539,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   window.addEventListener('blur',clearDrag);
   levelBar.addEventListener('click',e=>{if(performance.now()<suppressClickUntil){e.preventDefault();e.stopImmediatePropagation();}},{capture:true});
   function goSection(sectionId) {
+    readingTarget=null;
     const section=sections.get(sectionId);if(!section)return;
     const before=state.level==='map'?captureZoom():null;
     resumeTouched=true;
@@ -1686,6 +1692,14 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   });
   $('brief-chat-copy').addEventListener('click',()=>copyText($('brief-chat-draft'),$('brief-chat-feedback')));
   $('brief-chat-replace').addEventListener('click',()=>{if(!$('brief-chat-draft').value)return;window.parent.postMessage({type:'input:prompt',text:$('brief-chat-draft').value},'*');$('brief-chat-feedback').textContent='Draft placed in chat. Close this dialog, check the draft and press Send with Document Reader selected.';});
+  function openPassageInReader(p,dialogId){
+    $(dialogId).close();stopZoom();resumeTouched=true;
+    state.level='full';state.lastTextLevel='full';state.mapReturn=null;state.active=p.id;state.expanded.delete(p.id);readingTarget=p.id;
+    render();restoreAnchor({id:p.id,offset:18});
+    const article=$('passage-'+p.id);article.tabIndex=-1;dialogTriggers.set(dialogId,article);article.focus({preventScroll:true});updatePosition();
+    announce('Opened '+(sections.get(p.section_id)?.title||'source')+' in Full text. Use levels 1 to 5 to explore this passage.');
+    return article;
+  }
   function searchSource(){
     const query=$('search-input').value.trim(),list=$('search-results');list.replaceChildren();
     if(!query){$('search-status').textContent='Search includes text hidden at shorter reading levels.';return;}
@@ -1696,14 +1710,14 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     }
     $('search-status').textContent=count?(count+(count===1?' match':' matches')+' in source'+(count>100?' · showing the first 100; refine your search.':'.')):'No matches in the source. Try a shorter word or phrase.';
     for(const m of matches){
-      const {p,text,start,end}=m,b=button('','search-result',()=>{
-        $('search-dialog').close();stopZoom();resumeTouched=true;state.level='full';render();restoreAnchor({id:p.id,offset:18});updatePosition();
-        const article=$('passage-'+p.id);article.tabIndex=-1;article.focus({preventScroll:true});let offset=0;const ids=[];
+      const {p,text,start,end}=m,b=el('div','search-result'),actions=el('div','search-actions');
+      actions.append(button('Open in reader','primary',()=>openPassageInReader(p,'search-dialog')),button('Inspect source','',()=>{
+        const article=openPassageInReader(p,'search-dialog');let offset=0;const ids=[];
         for(const u of p.units){if(offset<end&&offset+u.text.length>start)ids.push(u.id);offset+=u.text.length;}
         inspect(ids,article,p.id);announce('Found in '+sections.get(p.section_id)?.title+'. Matching source units are highlighted.');
-      });
+      }));
       b.append(el('strong','',(sections.get(p.section_id)?.title||'Source')+' · Passage '+(p.index+1)));
-      b.append(document.createTextNode((start>70?'…':'')+text.slice(Math.max(0,start-70),start)),el('mark','',text.slice(start,end)),document.createTextNode(text.slice(end,end+110)+(end+110<text.length?'…':'')));list.append(b);
+      b.append(document.createTextNode((start>70?'…':'')+text.slice(Math.max(0,start-70),start)),el('mark','',text.slice(start,end)),document.createTextNode(text.slice(end,end+110)+(end+110<text.length?'…':'')),actions);list.append(b);
     }
   }
   $('search-button').addEventListener('click',e=>{showDialog('search-dialog',e.currentTarget);$('search-input').focus();});
@@ -1819,6 +1833,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   }
   $('source-previous').addEventListener('click',() => {if(sourceIndex>0){sourceIndex--;renderSource();}});
   $('source-next').addEventListener('click',() => {if(sourceIndex<data.passages.length-1){sourceIndex++;renderSource();}});
+  $('source-dialog').querySelector('.dialog-footer').append(button('Open in reader','primary',()=>openPassageInReader(passages.get(data.passages[sourceIndex].id),'source-dialog')));
   function encodeBookmark(value) {return 'DR1.'+btoa(Array.from(new TextEncoder().encode(JSON.stringify(value)),n=>String.fromCharCode(n)).join(''));}
   function savedPosition(anchor=null){const a=anchor||captureAnchor();return {v:1,fingerprint:data.fingerprint,passage:a.id,level:state.level,offset:Math.round(a.offset),lastTextLevel:state.lastTextLevel,mapAnchor:state.level==='map'?layoutAnchor:null,expanded:Array.from(state.expanded).slice(0,30)};}
   function validPosition(value){return value&&value.v===1&&value.fingerprint===data.fingerprint&&passages.has(value.passage)&&Object.hasOwn(labels,value.level)&&typeof value.offset==='number'&&Number.isFinite(value.offset)&&Math.abs(value.offset)<=100000;}
@@ -1826,7 +1841,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     if(!validPosition(value))return false;
     state.level=value.level;state.active=value.passage;state.lastTextLevel=Object.hasOwn(labels,value.lastTextLevel)&&value.lastTextLevel!=='map'?value.lastTextLevel:state.level==='map'?'takeaways':state.level;
     state.expanded=new Set((Array.isArray(value.expanded)?value.expanded:[]).filter(id=>passages.has(id)).slice(0,30));
-    const anchor={id:value.passage,offset:value.offset};state.mapReturn=state.level==='map'?anchor:null;render();
+    const anchor={id:value.passage,offset:value.offset};readingTarget=null;state.mapReturn=state.level==='map'?anchor:null;render();
     if(state.level==='map'){scroller.scrollTop=0;const a=value.mapAnchor;if(a&&a.kind==='map'&&sections.has(a.id)&&Number.isFinite(a.offset)&&Math.abs(a.offset)<=100000){const card=content.querySelector('[data-map-section="'+CSS.escape(a.id)+'"]');if(card)scroller.scrollTop+=card.getBoundingClientRect().top-scroller.getBoundingClientRect().top-a.offset;}}
     else restoreAnchor(anchor);updatePosition();announce('Your reading position was restored. '+$('position').textContent);return true;
   }
@@ -1866,7 +1881,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
       const value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(Uint8Array.from(atob(token.slice(4)),c=>c.charCodeAt(0))));
       if(!value||value.v!==1||value.fingerprint!==data.fingerprint)throw new Error('This bookmark belongs to a different document version.');
       if(!passages.has(value.passage)||!Object.hasOwn(labels,value.level)||typeof value.offset!=='number'||!Number.isFinite(value.offset)||Math.abs(value.offset)>100000)throw new Error('This bookmark has an invalid reading position.');
-      const anchor={id:value.passage,offset:value.offset};resumeTouched=true;state.expanded.clear();state.level=value.level;state.active=value.passage;
+      const anchor={id:value.passage,offset:value.offset};readingTarget=null;resumeTouched=true;state.expanded.clear();state.level=value.level;state.active=value.passage;
       if(state.level==='map'){state.mapReturn=anchor;state.lastTextLevel='takeaways';}else state.lastTextLevel=state.level;
       render();if(state.level==='map'){scroller.scrollTop=0;updatePosition();}else restoreAnchor(anchor);
       $('bookmark-dialog').close();announce('Bookmark restored. '+labels[state.level]+'. '+$('position').textContent+'.');

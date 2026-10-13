@@ -2,7 +2,7 @@
 
 Document Reader is an Open WebUI Pipe Function for reading one document at five levels: **Section map, Takeaways, Explanation, Extracts and Full text**. Paste text or Markdown, use **Attach Webpage**, or attach a DOCX, text-based PDF, TXT or Markdown file. Prepare it once, then change levels and inspect the source inside the saved response.
 
-Version **0.6.0** adds **Attach Notes**, local **Find** over the complete source, and **Send brief to chat**. These additions stay inside the Pipe Function and use existing OWUI note permissions, composer drafts and citation events. There are no new routes, dependencies or OWUI application changes. Regenerate an older Reader to obtain the new controls.
+Version **0.6.1** adds **Open in reader** to Find results and the source viewer, so a found passage can be explored through levels 1–5. Version 0.6.0 introduced **Attach Notes**, local **Find** over the complete source, and **Send brief to chat**. These additions stay inside the Pipe Function and use existing OWUI note permissions, composer drafts and citation events. There are no new routes, dependencies or OWUI application changes. Regenerate an older Reader to obtain the new controls.
 
 The installable artifact is [document_reader.py](../document_reader.py). It uses Open WebUI's existing extraction, users, file permissions and configured models. It adds no routes, provider credentials, parser packages or database tables. The [PoC plan](document-reader-poc-plan.md) records the design and acceptance criteria.
 
@@ -99,7 +99,7 @@ No provider key is entered in these Valves. The delegated call uses OWUI's exist
 
 ### Zoom, questions and reading briefs
 
-**Find** searches the complete saved source, including wording absent from the current compressed level and source-only passages. Search is literal and case-insensitive, tolerates differences in whitespace, and shows up to 100 matching snippets. Selecting a result jumps to Full text and opens Inspect source with the matching source units highlighted. Closing search without choosing a result keeps your reading level and place. Search stays within the iframe, makes no network/model calls and adds no global keyboard shortcut.
+**Find** searches the complete saved source, including wording absent from the current compressed level and source-only passages. Search is literal and case-insensitive, tolerates differences in whitespace, and shows up to 100 matching snippets. Each result offers **Open in reader**, which closes search and focuses the passage in Full text so you can move through levels 1–5, and **Inspect source**, which highlights the matching source units. The source viewer also offers **Open in reader** for its currently displayed passage, including after Previous/Next navigation. The section map retains the passage for your return to a text level. Source-only passages retain their existing fallback at shorter levels. Closing search without choosing a result keeps your reading level and place; reopening Find retains your query and results. Search stays within the iframe, makes no network/model calls and adds no global keyboard shortcut.
 
 Scroll over the level bar to step through detail, or drag horizontally and release on a level. The highlighted target previews the change. Vertical touch movement cancels the drag; Ctrl/Cmd-wheel remains available for browser zoom. There are no new keyboard shortcuts. Buttons keep their normal keyboard behaviour.
 
@@ -281,3 +281,9 @@ Function 0.6.0 was installed through the OWUI editor with existing Valves retain
 A synthetic OWUI Note prepared all three batches and six source passages. Find located wording hidden at the overview level and displayed the correct passage number. Sending a selected reading brief through the normal chat draft and Send controls returned an ordinary cited response with zero model calls. OWUI's source viewer opened the exact supporting sentence; citation numbering accounts for sources that OWUI inserts before the Pipe's evidence. Retrying the saved Note Reader reused all three batches with zero new model calls.
 
 These live checks used an administrator account. Shared, revoked and deleted Note access scenarios are covered by local tests; live ordinary-user acceptance remains outstanding. Previously saved Readers retain their embedded interface and need regeneration to expose the new controls.
+
+### Recorded search navigation check — 7 October 2026
+
+Function 0.6.1 adds separate Open in reader and Inspect source actions to search results, plus Open in reader in the source viewer. All **176 focused tests passed**, including navigation through five levels, the inspector's current passage, mobile layout and short-document anchoring. Explicit search navigation keeps the found passage selected even when there is insufficient text below it to scroll it to the top; manual scrolling or another navigation releases that anchor.
+
+The installed code was reloaded and its Python syntax tree matched the local source. In the live synthetic Note Reader, finding “security lead” and opening its result retained passage p0004 through Full text, Extracts, Explanation, Takeaways, Section map and back to Full text. Returning from the source viewer also retained p0004 in Explanation. Existing Valves and OWUI application code were unchanged.
