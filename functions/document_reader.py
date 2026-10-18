@@ -1,7 +1,7 @@
 """
 title: Document Reader
 author: Document Reader contributors
-version: 0.6.1
+version: 0.7.0
 description: Five linked reading levels for text, Markdown, documents, webpages and OWUI Notes. Search the source, ask passage questions and send a reading brief to chat.
 required_open_webui_version: 0.11.3
 license: MIT
@@ -9,16 +9,20 @@ license: MIT
 
 import asyncio
 import base64
+import csv
 import hashlib
+import io
 import json
 import logging
 import re
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Optional
 from urllib.parse import quote, urlsplit
+from zipfile import ZipFile, BadZipFile
+from xml.etree import ElementTree
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -31,10 +35,516 @@ PRIVACY_NOTICE = (
     "Sharing or exporting the chat may disclose that text."
 )
 SUPPORTED_EXTENSIONS = {".docx", ".pdf", ".md", ".markdown", ".txt"}
+TABLE_EXTENSIONS = {".csv", ".tsv", ".xlsx"}
+SUPPORTED_EXTENSIONS |= TABLE_EXTENSIONS
 
 
 class ReaderError(ValueError):
     """A bounded, user-facing failure, never an arbitrary provider error."""
+
+
+class TableCell(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal[
+        "text", "number", "boolean", "date", "blank", "missing", "formula", "error"
+    ]
+    value: str = Field(max_length=32768)
+    number_format: str = Field(default="", max_length=1000)
+    cached: Optional[str] = Field(default=None, max_length=32768)
+    cached_kind: Optional[Literal["text", "number", "boolean", "date", "error"]] = None
+
+
+class SourceTable(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str = Field(min_length=1, max_length=1000)
+    rows: list[list[TableCell]] = Field(min_length=1, max_length=1000)
+    hidden: bool = False
+    hidden_rows: list[int] = Field(default_factory=list, max_length=1000)
+    hidden_columns: list[int] = Field(default_factory=list, max_length=50)
+    merged: list[str] = Field(default_factory=list, max_length=1000)
+
+
+class TableSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    format: Literal["csv", "tsv", "xlsx"]
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    header_row: int = Field(ge=0, le=100)
+    encoding: str = Field(default="", max_length=30)
+    delimiter: str = Field(default="", max_length=1)
+    tables: list[SourceTable] = Field(min_length=1, max_length=5)
+
+
+def column_name(index):
+    result = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def table_row_text(source, table, row_number):
+    """Canonical, self-contained evidence. Formatting/provenance are hash-bound too."""
+    row = table["rows"][row_number - 1]
+    header = (
+        table["rows"][source["header_row"] - 1]
+        if 0 < source["header_row"] <= len(table["rows"])
+        else []
+    )
+    sheet = "'" + table["name"].replace("'", "''") + "'"
+    lines = [
+        f"{sheet}!A{row_number}:{column_name(len(row))}{row_number} · header row {source['header_row']}"
+    ]
+    if row_number == 1:
+        lines.append(
+            "Source: "
+            + json.dumps(
+                {k: source[k] for k in ("format", "sha256", "encoding", "delimiter")},
+                ensure_ascii=False,
+            )
+        )
+    if table["hidden"]:
+        lines.append("Hidden sheet (included).")
+    if row_number in table["hidden_rows"]:
+        lines.append("Hidden row (included).")
+    if table["merged"]:
+        lines.append("Merged ranges (source grid only): " + ", ".join(table["merged"]))
+    for col, cell in enumerate(row, 1):
+        label = f"{column_name(col)}{row_number}"
+        if header:
+            label += (
+                " (header "
+                + json.dumps(header[col - 1]["value"], ensure_ascii=False)
+                + ")"
+            )
+        attributes = [cell["kind"]]
+        if col in table["hidden_columns"]:
+            attributes.append("hidden column")
+        if cell["number_format"]:
+            attributes.append(
+                "stored format " + json.dumps(cell["number_format"], ensure_ascii=False)
+            )
+        lines.append(
+            label
+            + " ["
+            + "; ".join(attributes)
+            + "]: "
+            + (cell["value"] if cell["value"] else "(empty)")
+        )
+        if cell["kind"] == "formula":
+            lines.append(
+                "Saved formula result: "
+                + (
+                    "unavailable; not calculated"
+                    if cell["cached"] is None
+                    else f"{cell['cached']} [{cell['cached_kind']}; may be stale; not recalculated]"
+                )
+            )
+    return "\n".join(lines) + "\n\n"
+
+
+def checked_table_source(source, valves):
+    try:
+        source = TableSource.model_validate(source).model_dump()
+    except ValidationError:
+        raise ReaderError(
+            "The table contains invalid or oversized cells. Use plain scalar values with no cell longer than 32,768 characters."
+        ) from None
+    cells = 0
+    for table in source["tables"]:
+        width = len(table["rows"][0])
+        if (
+            not 1 <= width <= valves.MAX_TABLE_COLUMNS
+            or len(table["rows"]) > valves.MAX_TABLE_ROWS
+        ):
+            raise ReaderError(
+                "The table exceeds the row or column limit. Attach a smaller table; no rows were truncated."
+            )
+        if any(len(row) != width for row in table["rows"]):
+            raise ReaderError("The saved table has inconsistent row widths.")
+        if any(
+            type(n) is not int or not 1 <= n <= len(table["rows"])
+            for n in table["hidden_rows"]
+        ) or any(
+            type(n) is not int or not 1 <= n <= width for n in table["hidden_columns"]
+        ):
+            raise ReaderError(
+                "The saved table has invalid hidden row or column references."
+            )
+        if source["header_row"] > len(table["rows"]):
+            raise ReaderError(
+                "TABLE_HEADER_ROW is outside a sheet. Set it to a valid row or 0 for column letters, then prepare again."
+            )
+        cells += width * len(table["rows"])
+    if (
+        cells > valves.MAX_TABLE_CELLS
+        or len(source["tables"]) > valves.MAX_TABLE_SHEETS
+    ):
+        raise ReaderError(
+            "The workbook exceeds the cell or sheet limit. Attach a smaller workbook; no sheets were truncated."
+        )
+    return source
+
+
+def parse_table_bytes(raw, filename, valves):
+    if len(raw) > valves.MAX_TABLE_BYTES:
+        raise ReaderError(
+            "The table upload exceeds MAX_TABLE_BYTES. Attach a smaller file."
+        )
+    suffix = PurePosixPath(filename).suffix.lower()
+    source = {
+        "format": suffix[1:],
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "header_row": valves.TABLE_HEADER_ROW,
+        "tables": [],
+    }
+    if suffix in (".csv", ".tsv"):
+        encoding = valves.CSV_ENCODING
+        try:
+            text = raw.decode(encoding)
+        except UnicodeError:
+            raise ReaderError(
+                "The CSV encoding does not match CSV_ENCODING. Save as UTF-8 or choose the correct encoding in the Function Valves."
+            ) from None
+        delimiter = (
+            "\t"
+            if suffix == ".tsv"
+            else {"comma": ",", "semicolon": ";", "tab": "\t", "pipe": "|"}[
+                valves.CSV_DELIMITER
+            ]
+        )
+        source.update(encoding=encoding, delimiter=delimiter)
+        rows, width = [], 0
+        try:
+            for row in csv.reader(
+                io.StringIO(text, newline=""), delimiter=delimiter, strict=True
+            ):
+                if (
+                    len(rows) >= valves.MAX_TABLE_ROWS
+                    or len(row) > valves.MAX_TABLE_COLUMNS
+                ):
+                    raise ReaderError(
+                        "The CSV exceeds the row or column limit. Attach a smaller table; no rows were truncated."
+                    )
+                width = max(width, len(row))
+                rows.append([{"kind": "text", "value": value} for value in row])
+        except csv.Error:
+            raise ReaderError(
+                "The CSV contains invalid quoting or an oversized field. Check its delimiter and quoting."
+            ) from None
+        if not rows or not width:
+            raise ReaderError("The table file is empty.")
+        for row in rows:
+            row.extend(
+                {"kind": "missing", "value": ""} for _ in range(width - len(row))
+            )
+        source["tables"].append({"name": "Table", "rows": rows})
+    elif suffix == ".xlsx":
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            raise ReaderError(
+                "Excel reading requires openpyxl in the OWUI server environment. It is included in OWUI 0.11.3; ask your administrator to check the installation or attach CSV instead."
+            ) from None
+        # Bound expansion and XML coordinates before openpyxl allocates cells/styles.
+        try:
+            with ZipFile(io.BytesIO(raw)) as archive:
+                entries = archive.infolist()
+                if (
+                    len(entries) > 1000
+                    or sum(e.file_size for e in entries) > 20 * 1024 * 1024
+                ):
+                    raise ReaderError(
+                        "The Excel archive expands beyond the Reader limit. Attach a smaller workbook."
+                    )
+                if len({e.filename for e in entries}) != len(entries):
+                    raise ReaderError("The Excel archive contains duplicate entries.")
+                if any("vbaproject" in e.filename.lower() for e in entries):
+                    raise ReaderError(
+                        "Macro-containing workbooks are unsupported. Export a plain .xlsx or CSV."
+                    )
+                count = 0
+                for entry in entries:
+                    xml = archive.read(entry)
+                    if not entry.filename.lower().endswith(
+                        (".xml", ".rels")
+                    ) and not xml.lstrip(b"\xef\xbb\xbf \r\n\t").startswith(b"<"):
+                        continue
+                    if (
+                        b"\x00" in xml
+                        or b"<!DOCTYPE" in xml.upper()
+                        or b"<!ENTITY" in xml.upper()
+                    ):
+                        raise ReaderError(
+                            "Excel XML declarations with entities are unsupported."
+                        )
+                    root = ElementTree.fromstring(xml)
+                    if (
+                        root.tag
+                        == "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}worksheet"
+                    ):
+                        for merge in root.iter(
+                            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}mergeCell"
+                        ):
+                            from openpyxl.utils.cell import range_boundaries
+
+                            bounds = range_boundaries(merge.get("ref", ""))
+                            if (
+                                not all(isinstance(n, int) for n in bounds)
+                                or bounds[2] > valves.MAX_TABLE_COLUMNS
+                                or bounds[3] > valves.MAX_TABLE_ROWS
+                            ):
+                                raise ReaderError(
+                                    "A merged range exceeds the Reader limits. Export a smaller rectangular table."
+                                )
+                        for cell in root.iter(
+                            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"
+                        ):
+                            count += 1
+                            address = re.fullmatch(
+                                r"([A-Z]{1,3})([1-9]\d*)", cell.get("r", "")
+                            )
+                            col = 0
+                            if address:
+                                for char in address[1]:
+                                    col = col * 26 + ord(char) - 64
+                            if (
+                                not address
+                                or col > valves.MAX_TABLE_COLUMNS
+                                or int(address[2]) > valves.MAX_TABLE_ROWS
+                                or count > valves.MAX_TABLE_CELLS
+                            ):
+                                raise ReaderError(
+                                    "Excel cells extend beyond the Reader limits. Export a smaller rectangular range."
+                                )
+            book = load_workbook(io.BytesIO(raw), data_only=False, keep_links=False)
+            original = load_workbook(
+                io.BytesIO(raw), data_only=False, keep_links=False, read_only=True
+            )
+            cached = load_workbook(
+                io.BytesIO(raw), data_only=True, keep_links=False, read_only=True
+            )
+            try:
+                if len(book.worksheets) > valves.MAX_TABLE_SHEETS:
+                    raise ReaderError(
+                        "The workbook exceeds MAX_TABLE_SHEETS. Export fewer sheets."
+                    )
+                for sheet in book.worksheets:
+                    if (
+                        sheet.max_row > valves.MAX_TABLE_ROWS
+                        or sheet.max_column > valves.MAX_TABLE_COLUMNS
+                    ):
+                        raise ReaderError(
+                            "The sheet dimensions exceed the Reader limits. Export a smaller rectangular range."
+                        )
+
+                    def convert(cell):
+                        value = cell.value
+                        kind = {
+                            "f": "formula",
+                            "e": "error",
+                            "b": "boolean",
+                            "d": "date",
+                        }.get(cell.data_type)
+                        if value is None:
+                            kind, value = (
+                                "text"
+                                if cell.data_type in ("s", "str", "inlineStr")
+                                else "blank"
+                            ), ""
+                        else:
+                            if kind == "formula" and not isinstance(value, str):
+                                raise ReaderError(
+                                    "Array or data-table formulas are unsupported. Export their values to a plain table."
+                                )
+                            kind = kind or (
+                                "number" if isinstance(value, (float, int)) else "text"
+                            )
+                            value = (
+                                value.isoformat()
+                                if hasattr(value, "isoformat")
+                                else str(value)
+                            )
+                        if not isinstance(value, str):
+                            raise ReaderError(
+                                "Array or data-table formulas are unsupported. Export their values to a plain table."
+                            )
+                        return {
+                            "kind": kind,
+                            "value": value,
+                            "number_format": cell.number_format or "",
+                        }
+
+                    rows = []
+                    raw_rows = original[sheet.title].iter_rows(
+                        min_row=1,
+                        max_row=sheet.max_row,
+                        min_col=1,
+                        max_col=sheet.max_column,
+                    )
+                    cache_rows = cached[sheet.title].iter_rows(
+                        min_row=1,
+                        max_row=sheet.max_row,
+                        min_col=1,
+                        max_col=sheet.max_column,
+                    )
+                    for row, cache_row in zip(raw_rows, cache_rows):
+                        values = []
+                        for cell, cache_cell in zip(row, cache_row):
+                            value = convert(cell)
+                            if value["kind"] == "formula":
+                                result = convert(cache_cell)
+                                if result["kind"] != "blank":
+                                    value.update(
+                                        cached=result["value"],
+                                        cached_kind=result["kind"],
+                                    )
+                            values.append(value)
+                        rows.append(values)
+                    if not rows:
+                        rows = [[{"kind": "blank", "value": ""}]]
+                    hidden_cols = sorted(
+                        {
+                            i
+                            for d in sheet.column_dimensions.values()
+                            if d.hidden
+                            for i in range(
+                                max(1, d.min or 1),
+                                min(sheet.max_column, d.max or 1) + 1,
+                            )
+                        }
+                    )
+                    source["tables"].append(
+                        {
+                            "name": sheet.title,
+                            "rows": rows,
+                            "hidden": sheet.sheet_state != "visible",
+                            "hidden_rows": [
+                                i
+                                for i, d in sheet.row_dimensions.items()
+                                if d.hidden and i <= len(rows)
+                            ],
+                            "hidden_columns": hidden_cols,
+                            "merged": [str(r) for r in sheet.merged_cells.ranges],
+                        }
+                    )
+            finally:
+                book.close()
+                original.close()
+                cached.close()
+        except ReaderError:
+            raise
+        except (
+            BadZipFile,
+            ValueError,
+            KeyError,
+            TypeError,
+            OSError,
+            ElementTree.ParseError,
+        ):
+            raise ReaderError(
+                "This Excel file could not be read as a plain .xlsx workbook. Export a rectangular sheet to CSV or .xlsx and attach it again."
+            ) from None
+    else:
+        raise ReaderError("Use CSV, TSV or .xlsx for structured tables.")
+    return checked_table_source(source, valves)
+
+
+def build_table_snapshot(source, filename, file_id, model_id, valves):
+    source = checked_table_source(source, valves)
+    snapshot = {
+        "version": 2,
+        "segmentation_version": "table-1",
+        "prompt_version": "table-1",
+        "filename": filename,
+        "file_id": file_id,
+        "model_id": model_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "complete",
+        "warnings": [],
+        "sections": [],
+        "passages": [],
+        "overviews": [],
+        "table_source": source,
+    }
+    position, unit_count = 0, 0
+    group_limit = min(2400, valves.MAX_BATCH_SOURCE_CHARS)
+    snapshot["table_batch_chars"] = valves.MAX_BATCH_SOURCE_CHARS
+    for ti, table in enumerate(source["tables"]):
+        section = {
+            "id": f"s{ti + 1:04d}",
+            "title": table["name"],
+            "heading_kind": "table",
+            "passage_ids": [],
+        }
+        snapshot["sections"].append(section)
+        passage = None
+        for ri, row in enumerate(table["rows"], 1):
+            text = table_row_text(source, table, ri)
+            if len(text) > valves.MAX_BATCH_SOURCE_CHARS:
+                raise ReaderError(
+                    "A source row exceeds the batch character limit. Export fewer columns or increase MAX_BATCH_SOURCE_CHARS."
+                )
+            if (
+                passage is None
+                or sum(len(u["text"]) for u in passage["units"]) + len(text)
+                > group_limit
+            ):
+                reason = (
+                    "Merged cells: source grid only; export a rectangular table for AI levels."
+                    if table["merged"]
+                    else ""
+                )
+                passage = {
+                    "id": f"p{len(snapshot['passages']) + 1:04d}",
+                    "section_id": section["id"],
+                    "table_index": ti,
+                    "units": [],
+                    "source_only": bool(reason),
+                    "reason": reason,
+                    "generated": None,
+                }
+                snapshot["passages"].append(passage)
+                section["passage_ids"].append(passage["id"])
+            unit_count += 1
+            quoted_name = "'" + table["name"].replace("'", "''") + "'"
+            passage["units"].append(
+                {
+                    "id": f"u{unit_count:05d}",
+                    "text": text,
+                    "start": position,
+                    "end": position + len(text),
+                    "table_row": ri,
+                    "source_range": f"{quoted_name}!A{ri}:{column_name(len(row))}{ri}",
+                }
+            )
+            position += len(text)
+            if (
+                position > valves.MAX_SOURCE_CHARS
+                or len(snapshot["passages"]) > valves.MAX_PASSAGES
+            ):
+                raise ReaderError(
+                    "The structured table exceeds the Reader character or passage limit. Export a smaller range; no data was truncated."
+                )
+    text = "".join(u["text"] for p in snapshot["passages"] for u in p["units"])
+    snapshot["source_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    snapshot["fingerprint"] = hashlib.sha256(
+        (f"table-1:{group_limit}\0" + text).encode("utf-8")
+    ).hexdigest()
+    snapshot["warnings"] = [
+        "Table source: original upload. Row/cell references are preserved; blank rows and hidden content are included and labelled. Header row: "
+        + (
+            str(source["header_row"])
+            if source["header_row"]
+            else "none (column letters)"
+        )
+        + ". Change TABLE_HEADER_ROW in Function Valves and prepare again to correct it. Multiple blocks remain a sheet grid, not inferred records.",
+        "Cell values retain their stored types and number formats; Excel display formatting, charts, comments and pivot semantics are not reproduced. Formula results are saved caches, may be stale, and are never recalculated. Questions and reading levels describe cited rows; calculated totals/comparisons are not supported.",
+    ]
+    if source["format"] != "xlsx":
+        snapshot["warnings"].append(
+            f"CSV decoding: {source['encoding']}; delimiter: {repr(source['delimiter'])}. Change CSV_ENCODING / CSV_DELIMITER and prepare again if needed. CSV values remain text, including leading zeros."
+        )
+    return snapshot
 
 
 class EvidenceItem(BaseModel):
@@ -368,6 +878,8 @@ def _structured_blocks(text: str, filename: str):
 def build_snapshot(
     text: str, filename: str, file_id: str, model_id: str, valves
 ) -> dict:
+    if isinstance(text, dict):
+        return build_table_snapshot(text, filename, file_id, model_id, valves)
     if not isinstance(text, str) or not text.strip():
         raise ReaderError(
             "There is no usable text for this document. Paste its text or check attachment processing first."
@@ -719,6 +1231,11 @@ def batch_messages(batch: dict, snapshot: dict, repair: bool = False) -> list[di
         {
             "role": "system",
             "content": SYSTEM_PROMPT
+            + (
+                "\nThis is a structured table. Each source unit is an original row with named cells, stored types, header context and visibility. Header choice is a reading aid, not a verified business schema. Preserve identifiers, blanks, errors and row references. Describe only the supplied rows. Do not compute totals, averages, comparisons or trends; no calculation tool is available. Do not treat formula caches as current or calculate formulas. Hidden rows are explicitly marked; do not silently exclude them. Do not assume multiple blocks on a sheet form one dataset."
+                if snapshot.get("version") == 2
+                else ""
+            )
             + (
                 "\nYour previous response failed schema or evidence validation. Produce a fresh complete JSON result and double-check the exact IDs and required fields."
                 if repair
@@ -1098,7 +1615,7 @@ def question_snapshot(
         s = json.loads(blocks[0], object_pairs_hook=_unique_json)
         if (
             not isinstance(s, dict)
-            or s.get("version") != 1
+            or s.get("version") not in (1, 2)
             or s.get("reader_message_id") != ref["message"]
             or s.get("reader_chat_id") != chat_id
             or s.get("fingerprint") != ref["fingerprint"]
@@ -1183,6 +1700,42 @@ def question_snapshot(
             != s["source_sha256"]
         ):
             raise ValueError()
+        if s["version"] == 2:
+            # Rebuild the typed grid and require its evidence to be identical.
+            # Browser-supplied cells/ranges cannot disagree with saved source text.
+            limits = Pipe.Valves(
+                MAX_SOURCE_CHARS=1000000,
+                MAX_PASSAGES=2000,
+                MAX_BATCH_SOURCE_CHARS=s["table_batch_chars"],
+                MAX_TABLE_ROWS=1000,
+                MAX_TABLE_COLUMNS=50,
+                MAX_TABLE_CELLS=20000,
+                MAX_TABLE_SHEETS=5,
+            )
+            rebuilt = build_table_snapshot(
+                s["table_source"], s["filename"], s["file_id"], s["model_id"], limits
+            )
+            if (
+                rebuilt["sections"] != s["sections"]
+                or rebuilt["fingerprint"] != s["fingerprint"]
+                or len(rebuilt["passages"]) != len(s["passages"])
+            ):
+                raise ValueError()
+            for expected, actual in zip(rebuilt["passages"], s["passages"]):
+                if any(
+                    expected[key] != actual[key]
+                    for key in (
+                        "id",
+                        "section_id",
+                        "table_index",
+                        "units",
+                        "source_only",
+                        "reason",
+                    )
+                ):
+                    raise ValueError()
+        elif "table_source" in s or any("table_index" in p for p in s["passages"]):
+            raise ValueError()
     except (ValueError, TypeError, KeyError, UnicodeError, ReaderError):
         raise ReaderError(error) from None
     return s
@@ -1218,7 +1771,12 @@ def passage_context(snapshot: dict, passage_id: str) -> dict:
         "section": section["title"],
         "table_uncertain": (target.get("reason") or "").startswith("Table"),
         "units": [
-            {"id": u["id"], "text": u["text"], "passage": passages[i]["id"]}
+            {
+                "id": u["id"],
+                "text": u["text"],
+                "passage": passages[i]["id"],
+                **({"source_range": u["source_range"]} if "source_range" in u else {}),
+            }
             for i in sorted(selected)
             for u in selected[i]
         ],
@@ -1279,6 +1837,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
 .reading-content.map-content{max-width:none;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:16px;align-items:start}.map-content>.return-map,.map-content>.map-intro{grid-column:1/-1;justify-self:start;margin:0}.map-content>.map-card{margin:0;min-width:0}
 .formatted-source{white-space:normal!important}.formatted-source p{margin:0 0 .85em}.formatted-source p:last-child{margin-bottom:0}.formatted-source ul,.formatted-source ol{margin:.5em 0 1em;padding-left:1.55em}.formatted-source li{margin:.35em 0}.formatted-source li>ul,.formatted-source li>ol{margin:.2em 0 .5em}.formatted-source h3,.formatted-source h4{font-family:system-ui,sans-serif;font-size:1.1em;line-height:1.4;margin:1em 0 .5em}.formatted-source blockquote{border-left:2px solid var(--accent);margin:.7em 0;padding-left:1em}.formatted-source pre{white-space:pre-wrap;background:var(--wash);padding:12px;border-radius:6px;font-size:.85em}.formatted-source code{font-family:ui-monospace,monospace;font-size:.9em}.extraction-note{font-family:system-ui,sans-serif;color:var(--muted);font-size:11px;line-height:1.5;margin:8px 0}.front-matter{background:var(--wash);border-radius:8px;padding:15px!important}
 .source-metadata{background:var(--wash);border:1px solid var(--line);border-radius:8px;padding:12px 15px;margin-bottom:24px;font-size:12px;line-height:1.5}.source-metadata p{margin:5px 0}
+.table-scroll{overflow:auto;max-width:100%;font:14px/1.5 system-ui,sans-serif;white-space:normal;margin:12px 0;border:1px solid var(--line);border-radius:8px}.source-grid{border-collapse:collapse;width:100%;text-align:left}.source-grid caption{text-align:left;padding:12px;color:var(--muted)}.source-grid th,.source-grid td{border:1px solid var(--line);padding:8px 12px;min-width:100px;max-width:320px;white-space:pre-wrap;overflow-wrap:anywhere;vertical-align:top}.source-grid th{background:var(--wash);font-weight:600;position:sticky;top:0}.source-grid th[scope=row]{min-width:48px}.source-grid .cell-note{display:block;font-size:11px;color:var(--muted);margin-top:4px}.source-grid .highlight{background:var(--wash)}.source-grid .selected-evidence{outline:2px solid var(--accent);outline-offset:-2px}.table-notice{font:13px/1.5 system-ui,sans-serif;color:var(--muted);padding:12px 0}
 .markdown-syntax{display:none}
 @media(min-width:1250px){.workspace{grid-template-columns:clamp(210px,17vw,260px) minmax(0,1fr)}.reading-content{max-width:1100px;margin-inline:0 auto}.source-text,.generated-text{font-size:17px}.takeaway-text{font-size:18px}dialog{width:min(860px,calc(100% - 60px))}}
 @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
@@ -1328,7 +1887,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   window.addEventListener('pagehide', event => { if (!event.persisted) { themeObserver?.disconnect(); themeMedia.removeEventListener('change', applyTheme); } });
   window.addEventListener('pageshow', applyTheme);
   const data = JSON.parse(document.getElementById('reader-data').textContent);
-  if (data.version !== 1 || !Array.isArray(data.passages) || !data.passages.length || !Array.isArray(data.sections)) return;
+  if (![1,2].includes(data.version) || !Array.isArray(data.passages) || !data.passages.length || !Array.isArray(data.sections)) return;
   const $ = id => document.getElementById(id);
   const el = (tag, className, text) => { const n = document.createElement(tag); if (className) n.className = className; if (text !== undefined) n.textContent = text; return n; };
   const button = (text, className, action) => { const n = el('button', className, text); n.type = 'button'; n.addEventListener('click', action); return n; };
@@ -1337,6 +1896,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   const passages = new Map(data.passages.map((p,i) => [p.id,{...p,index:i}]));
   const sections = new Map(data.sections.map(s => [s.id,s]));
   const units = new Map(); data.passages.forEach(p => p.units.forEach(u => units.set(u.id,{...u,passageId:p.id})));
+  if(data.table_source){descriptions.full='Source grid · stored values and original row references';descriptions.extracts='Selected source rows · original columns preserved';$('info-dialog').querySelector('.dialog-description').textContent='Table grids and extracts come from the original uploaded file. Explanations, takeaways and overviews are AI generated from cited rows. Formulas are not recalculated.';$('source-dialog').querySelector('.dialog-description').textContent='Original source rows and cell references. Saved formula results may be stale. Cited rows are highlighted; the selected evidence is outlined.';}
   const content = $('reading-content'), scroller = $('reading-column');
   const firstReadable=data.passages.find(p=>!p.source_only)||data.passages.find(p=>p.reason!=='Section heading')||data.passages[0];
   const state = {level:'map',lastTextLevel:'takeaways',expanded:new Set(),mapReturn:null,lastVisited:new Map(),active:firstReadable.id};
@@ -1562,7 +2122,19 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   });
   $('section-select').addEventListener('change',e => goSection(e.target.value));
   function appendSource(container,p,highlight=new Set(),selected=null) {
+    if(Number.isInteger(p.table_index)){appendTable(container,p,p.units,highlight,selected);return;}
     p.units.forEach(u => { const n=el('span','source-unit'+(highlight.has(u.id)?' highlight':'')+(u.id===selected?' selected-evidence':''),u.text);n.dataset.unit=u.id;container.append(n); });
+  }
+  function appendTable(container,p,rowUnits,highlight=new Set(),selected=null){
+    const source=data.table_source,t=source.tables[p.table_index],header=source.header_row?t.rows[source.header_row-1]:null;
+    const wrap=el('div','table-scroll');wrap.tabIndex=0;wrap.setAttribute('role','region');wrap.setAttribute('aria-label',t.name+' source rows');
+    const grid=el('table','source-grid'),caption=el('caption','',t.name+(t.hidden?' · hidden sheet':'')+' · rows '+rowUnits.map(u=>u.table_row).join(', ')+' · '+(source.header_row?'header row '+source.header_row:'no header row'));grid.append(caption);
+    const head=el('thead',''),hr=el('tr','');const corner=el('th','','Row');corner.scope='col';hr.append(corner);
+    t.rows[0].forEach((_,i)=>{let n=i+1,c='';while(n){n--;c=String.fromCharCode(65+n%26)+c;n=Math.floor(n/26);}const h=el('th','',c+(header?' · '+(header[i].value||'(blank header)'):'')+(t.hidden_columns.includes(i+1)?' · hidden':''));h.scope='col';hr.append(h);});head.append(hr);grid.append(head);
+    const body=el('tbody','');rowUnits.forEach(u=>{const tr=el('tr','source-unit'+(highlight.has(u.id)?' highlight':'')+(u.id===selected?' selected-evidence':''));tr.dataset.unit=u.id;tr.dataset.extract=u.id;tr.title=u.source_range;const row=el('th','',String(u.table_row)+(t.hidden_rows.includes(u.table_row)?' · hidden':'')+(u.table_row===source.header_row?' · header':''));row.scope='row';tr.append(row);
+      t.rows[u.table_row-1].forEach(c=>{const td=el('td','');td.append(document.createTextNode(c.kind==='formula'?(c.cached===null?'No saved result':c.cached):c.kind==='missing'?'Missing field':c.kind==='blank'?'Blank cell':c.kind==='text'&&c.value===''?'Empty text':c.value));if(c.kind==='formula')td.append(el('span','cell-note','Formula: '+c.value+' · '+(c.cached===null?'not calculated':'saved result; may be stale')));else td.append(el('span','cell-note',c.kind));if(c.number_format&&c.number_format!=='General')td.append(el('span','cell-note','Stored format: '+c.number_format));tr.append(td);});body.append(tr);
+    });grid.append(body);wrap.append(grid);container.append(wrap);
+    if(t.merged.length)container.append(el('p','table-notice','Merged ranges: '+t.merged.join(', ')+'. Values remain at their original cells; merged layout is not reproduced.'));
   }
   function appendInline(container,text,preserveSyntax=false) {
     // A small inert Markdown subset. Document HTML/URLs never become executable
@@ -1593,6 +2165,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     return text;
   }
   function appendReading(container,p) {
+    if(Number.isInteger(p.table_index)){appendSource(container,p);return;}
     const text=readingText(p),excluded=p.units.some(u=>u.excluded);
     if((p.reason||'').startsWith('Table')||(!excluded&&!/(^|\n)[ \t]*(?:#{1,6}\s|[-*+]\s|\d+[.)]\s|>\s|```)|\*\*|__|`[^`]+`|\*[^*\n]+\*/.test(text))){appendSource(container,p);return;}
     container.classList.add('formatted-source');
@@ -1717,7 +2290,8 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
         for(const u of p.units){if(offset<end&&offset+u.text.length>start)ids.push(u.id);offset+=u.text.length;}
         inspect(ids,article,p.id);announce('Found in '+sections.get(p.section_id)?.title+'. Matching source units are highlighted.');
       }));
-      b.append(el('strong','',(sections.get(p.section_id)?.title||'Source')+' · Passage '+(p.index+1)));
+      let offset=0;const ranges=[];for(const u of p.units){if(offset<end&&offset+u.text.length>start&&u.source_range)ranges.push(u.source_range);offset+=u.text.length;}
+      b.append(el('strong','',(sections.get(p.section_id)?.title||'Source')+' · Passage '+(p.index+1)+(ranges.length?' · '+ranges.join(', '):'')));
       b.append(document.createTextNode((start>70?'…':'')+text.slice(Math.max(0,start-70),start)),el('mark','',text.slice(start,end)),document.createTextNode(text.slice(end,end+110)+(end+110<text.length?'…':'')),actions);list.append(b);
     }
   }
@@ -1759,13 +2333,14 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     if(heading){article.append(evidenceButton([],p.id));return article;}
     let provenance=raw?'Extracted source':(state.level==='extracts'?'Verbatim source':'AI generated');
     if(p.source_only||!p.generated)provenance=heading?'Source heading':'Extracted source';
+    if(Number.isInteger(p.table_index)&&(raw||p.source_only||!p.generated))provenance='Original table cells';
     const meta=el('div','passage-meta');meta.append(el('span','passage-index',String(p.index+1).padStart(2,'0')),el('span','provenance',provenance));article.append(meta);
     if(expanded && state.level!=='full')article.append(el('div','expanded-label','Expanded passage · full source text'));
     if(!raw && !heading && (p.source_only||!p.generated))article.append(el('div','fallback-reason'+(p.source_only?' source-only-note':''),p.source_only ? 'Source only · '+(p.reason||'This passage is preserved without AI interpretation.') : 'AI level unavailable · '+(p.error||'This passage was not prepared. Source text is shown below.')));
     if(!raw&&(p.reason==='Document cover'||p.reason==='Contents listing'))article.append(el('p','empty',p.reason==='Document cover'?'Cover material is preserved in Full text and Inspect source.':'Use the section map to navigate; the original contents listing is preserved in Full text and Inspect source.'));
     else if(raw||p.source_only||!p.generated){const text=el('div','source-text');appendReading(text,p);article.append(text);}
     else if(state.level==='extracts'){
-      const selected=new Set(p.generated.extract_ids);p.units.filter(u=>selected.has(u.id)).forEach(u => {const quote=el('blockquote','extract source-text');appendInline(quote,u.text,true);quote.dataset.extract=u.id;article.append(quote);});
+      const selected=new Set(p.generated.extract_ids);if(Number.isInteger(p.table_index))appendTable(article,p,p.units.filter(u=>selected.has(u.id)));else p.units.filter(u=>selected.has(u.id)).forEach(u => {const quote=el('blockquote','extract source-text');appendInline(quote,u.text,true);quote.dataset.extract=u.id;article.append(quote);});
       if(!selected.size)article.append(el('p','empty','No extract selected. Inspect the complete source passage.'));
     }else{
       const items=p.generated[state.level]||[];items.forEach(item => {const group=el('div','generated-item');group.append(el('p','generated-text'+(state.level==='takeaways'?' takeaway-text':''),item.text),evidenceButton(item.evidence,p.id));article.append(group);});
@@ -1786,6 +2361,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   function renderMap() {
     if(state.mapReturn)content.append(button('← Return to '+labels[state.lastTextLevel].toLowerCase(),'return-map',() => changeLevel(state.lastTextLevel)));
     const intro=el('section','document-overview');intro.append(el('div','eyebrow quiet','Start here'),el('h2','','Understand this document'),el('p','map-intro','Explore the main topics and key concepts below. Choose a section for its takeaways, then move towards the original wording. AI explanations are a guide; inspect the source for exact conditions.'));
+    if(data.table_source)intro.append(el('p','table-notice','Source tables · '+(data.table_source.header_row?'Header row '+data.table_source.header_row:'No header row')+'. All rows, including hidden content, are included. Formula results are saved values and may be stale. About this reader explains header and CSV settings.'));
     const substantive=data.sections.filter(s=>!isFront(s)), purpose=substantive.find(s=>/purpose|scope|introduction|executive summary/i.test(s.title));
     const opening=purpose&&(data.overviews||[]).find(o=>o.section_id===purpose.id);
     if(opening){intro.append(el('h3','',purpose.title),el('p','generated-text',opening.text),evidenceButton(opening.evidence,opening.passage_ids[0]));}
@@ -1826,7 +2402,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
     sourceEvidence.forEach((id,i) => {const b=button('Evidence '+(i+1),'citation',() => {sourceIndex=passages.get(units.get(id).passageId).index;sourceSelected=id;renderSource();const mark=$('source-text').querySelector('[data-unit="'+CSS.escape(id)+'"]');if(mark)mark.scrollIntoView({block:'nearest'});});b.dataset.unitRef=id;b.setAttribute('aria-label','Show evidence '+(i+1));b.setAttribute('aria-pressed',String(id===sourceSelected));citations.append(b);});
     citations.hidden=!sourceEvidence.length;
     const selectedHere=sourceSelected&&units.get(sourceSelected)?.passageId===p.id;
-    $('source-location').textContent=(sections.get(p.section_id)?.title||'Source')+' · passage '+(p.index+1)+(selectedHere?' · Evidence '+(sourceEvidence.indexOf(sourceSelected)+1)+' of '+sourceEvidence.length:sourceEvidence.some(id=>units.get(id).passageId===p.id)?' · cited evidence':' · surrounding context');
+    $('source-location').textContent=(sections.get(p.section_id)?.title||'Source')+' · passage '+(p.index+1)+(selectedHere?' · Evidence '+(sourceEvidence.indexOf(sourceSelected)+1)+' of '+sourceEvidence.length:sourceEvidence.some(id=>units.get(id).passageId===p.id)?' · cited evidence':' · surrounding context')+(selectedHere&&units.get(sourceSelected)?.source_range?' · '+units.get(sourceSelected).source_range:'');
     const text=$('source-text');text.replaceChildren();appendSource(text,p,highlighted,sourceSelected);$('source-body').scrollTop=0;
     $('source-count').textContent=(p.index+1)+' of '+data.passages.length;
     $('source-previous').disabled=sourceIndex===0;$('source-next').disabled=sourceIndex===data.passages.length-1;
@@ -1892,7 +2468,7 @@ dialog{color:var(--ink);background:var(--panel);border:1px solid var(--line);bor
   $('snapshot-status').textContent=data.status==='partial'?'Partly prepared':'Ready to read';$('snapshot-status').classList.toggle('partial',data.status==='partial');
   $('coverage-note').textContent=data.status==='partial'?'Some explanations are unavailable':data.sections.filter(s=>!isFront(s)).length+' sections';$('coverage-note').classList.toggle('partial-note',data.status==='partial');
   const details=el('dl','snapshot-meta');[['Document',data.filename],['Model',data.model_id],['Prepared',data.created_at],['Coverage',data.status==='partial'?'Partial snapshot':'Prepared snapshot']].forEach(([key,value])=>{details.append(el('dt','',key),el('dd','',value||'Not recorded'));});$('snapshot-details').append(details);
-  const origin=data.source_origin||{kind:'file'};const originLabel={file:'Attached file · OWUI extraction',paste:'Pasted text / Markdown',text:'Attached text',web:'Attached webpage · saved OWUI extraction',note:'OWUI Note · saved Markdown edition'}[origin.kind]||'Saved source';$('snapshot-details').append(el('p','',originLabel));if(origin.url)$('snapshot-details').append(el('p','',origin.url));
+  const origin=data.source_origin||{kind:'file'};const originLabel={file:data.table_source?'Attached table · original OWUI upload':'Attached file · OWUI extraction',paste:'Pasted text / Markdown',text:'Attached text',web:'Attached webpage · saved OWUI extraction',note:'OWUI Note · saved Markdown edition'}[origin.kind]||'Saved source';$('snapshot-details').append(el('p','',originLabel));if(origin.url)$('snapshot-details').append(el('p','',origin.url));
   if(data.generation){const g=data.generation;$('snapshot-details').append(el('p','',g.completed_batches+' of '+g.total_batches+' batches prepared · '+(g.reused_batches||0)+' reused · '+g.calls+' new model calls.'));}
   if((data.warnings||[]).length){const list=el('ul','detail-list');data.warnings.forEach(w=>list.append(el('li','',w)));$('snapshot-details').append(el('h3','eyebrow','Preparation notes'),list);}
   (data.extraction_metadata||[]).forEach(note=>{const n=el('aside','source-metadata');n.append(el('div','eyebrow quiet','Document edition · extracted footer'),el('p','',note.text),evidenceButton(note.evidence,units.get(note.evidence[0])?.passageId));$('snapshot-details').append(n);});
@@ -1931,6 +2507,19 @@ class Pipe:
             description="An ordinary server-backed text model permitted for Reader users; never this Pipe, an arena or a browser-direct model.",
         )
         MAX_SOURCE_CHARS: int = Field(default=100000, ge=100, le=1000000)
+        MAX_TABLE_BYTES: int = Field(default=2097152, ge=1024, le=8388608)
+        MAX_TABLE_ROWS: int = Field(default=1000, ge=1, le=1000)
+        MAX_TABLE_COLUMNS: int = Field(default=50, ge=1, le=50)
+        MAX_TABLE_CELLS: int = Field(default=20000, ge=1, le=20000)
+        MAX_TABLE_SHEETS: int = Field(default=5, ge=1, le=5)
+        TABLE_HEADER_ROW: int = Field(
+            default=1,
+            ge=0,
+            le=100,
+            description="Header row for every sheet. 0 uses column letters. All rows, including rows before this header, remain in the source. Change and prepare a new Reader to correct the choice.",
+        )
+        CSV_ENCODING: Literal["utf-8-sig", "utf-16", "cp1252"] = "utf-8-sig"
+        CSV_DELIMITER: Literal["comma", "semicolon", "tab", "pipe"] = "comma"
         MAX_PASSAGES: int = Field(default=500, ge=1, le=2000)
         MAX_BATCH_SOURCE_CHARS: int = Field(default=10000, ge=100, le=30000)
         MAX_BATCH_PASSAGES: int = Field(default=20, ge=1, le=100)
@@ -2190,18 +2779,18 @@ class Pipe:
                 )
         if not isinstance(message, dict) or message.get("role", "user") != "user":
             raise ReaderError(
-                "Attach one DOCX, PDF, TXT or Markdown document to the current message. Inherited chat/project files are not selected automatically."
+                "Attach one DOCX, PDF, TXT, Markdown, CSV, TSV or XLSX document to the current message. Inherited chat/project files are not selected automatically."
             )
         attachments = message.get("files")
         if not isinstance(attachments, list) or not attachments:
             raise ReaderError(
-                "Attach one DOCX, PDF, TXT or Markdown document to the current message."
+                "Attach one DOCX, PDF, TXT, Markdown, CSV, TSV or XLSX document to the current message."
             )
         ids = set()
         for item in attachments:
             if not isinstance(item, dict) or item.get("type", "file") != "file":
                 raise ReaderError(
-                    "Attach one individual DOCX, PDF, TXT or Markdown file, not images, folders or Knowledge collections."
+                    "Attach one individual DOCX, PDF, TXT, Markdown, CSV, TSV or XLSX file, not images, folders or Knowledge collections."
                 )
             nested = item.get("file") if isinstance(item.get("file"), dict) else {}
             file_id = item.get("id") or nested.get("id")
@@ -2221,6 +2810,39 @@ class Pipe:
                 "Attach exactly one document to this message. Start a separate Reader chat for another document."
             )
         return next(iter(ids))
+
+    @staticmethod
+    async def _load_table(file, valves):
+        from open_webui.storage.provider import Storage
+
+        if not getattr(file, "path", None):
+            raise ReaderError(
+                "The original table upload is unavailable. Attach the file again; extracted text cannot preserve its cell references."
+            )
+        size = (file.meta if isinstance(getattr(file, "meta", None), dict) else {}).get(
+            "size"
+        )
+        if isinstance(size, (int, float)) and size > valves.MAX_TABLE_BYTES:
+            raise ReaderError(
+                "The table upload exceeds MAX_TABLE_BYTES. Attach a smaller file."
+            )
+
+        def read():
+            try:
+                path = Path(Storage.get_file(file.path))
+                if not path.is_file() or path.stat().st_size > valves.MAX_TABLE_BYTES:
+                    raise ReaderError(
+                        "The original table is unavailable or exceeds MAX_TABLE_BYTES."
+                    )
+                with path.open("rb") as handle:
+                    raw = handle.read(valves.MAX_TABLE_BYTES + 1)
+                return parse_table_bytes(raw, file.filename, valves)
+            except OSError:
+                raise ReaderError(
+                    "The original table upload could not be read from OWUI storage."
+                ) from None
+
+        return await asyncio.to_thread(read)
 
     @staticmethod
     async def _load_source(file_id, user, valves, emitter):
@@ -2245,8 +2867,13 @@ class Pipe:
                 not in SUPPORTED_EXTENSIONS
             ):
                 raise ReaderError(
-                    "Document Reader supports DOCX, text-based PDF, Markdown and TXT files."
+                    "Document Reader supports DOCX, text-based PDF, Markdown, TXT, CSV, TSV and .xlsx files."
                 )
+            if (
+                PurePosixPath(filename.replace("\\", "/")).suffix.lower()
+                in TABLE_EXTENSIONS
+            ):
+                return file, await Pipe._load_table(file, valves), []
             data = file.data if isinstance(file.data, dict) else {}
             content = data.get("content")
             status = data.get("status")
@@ -2830,6 +3457,28 @@ class Pipe:
                     "The original document is unavailable or you no longer have access to it."
                 )
             current = (file.data if isinstance(file.data, dict) else {}).get("content")
+            if snapshot.get("version") == 2:
+                table_valves = valves.model_copy(
+                    update={
+                        "TABLE_HEADER_ROW": snapshot["table_source"]["header_row"],
+                        "CSV_ENCODING": snapshot["table_source"]["encoding"]
+                        or valves.CSV_ENCODING,
+                        "CSV_DELIMITER": {
+                            ",": "comma",
+                            ";": "semicolon",
+                            "\t": "tab",
+                            "|": "pipe",
+                        }.get(
+                            snapshot["table_source"]["delimiter"], valves.CSV_DELIMITER
+                        ),
+                    }
+                )
+                current = await self._load_table(file, table_valves)
+                current = "".join(
+                    table_row_text(current, table, i)
+                    for table in current["tables"]
+                    for i in range(1, len(table["rows"]) + 1)
+                )
         else:
             _, current, _, current_origin, _ = await self._saved_input(
                 snapshot, metadata, user, valves, emitter
@@ -2860,7 +3509,7 @@ class Pipe:
         ):
             output += "\n\nThe original source has changed. This brief uses the saved edition."
         for p, unit in citations:
-            name = snapshot["filename"] + " · " + unit["id"]
+            name = snapshot["filename"] + " · " + unit.get("source_range", unit["id"])
             await emitter(
                 {
                     "type": "citation",
@@ -2873,6 +3522,11 @@ class Pipe:
                                 **self._citation_origin(snapshot),
                                 "passage_id": p["id"],
                                 "source_unit_id": unit["id"],
+                                **(
+                                    {"source_range": unit["source_range"]}
+                                    if "source_range" in unit
+                                    else {}
+                                ),
                             }
                         ],
                         "source": {"name": name},
@@ -2934,6 +3588,10 @@ class Pipe:
         await self._status(
             emitter, "Answering from the saved passage and its source context…"
         )
+        if snapshot.get("version") == 2:
+            messages[0][
+                "content"
+            ] += " Table units preserve cell types and source row references. Saved formula caches may be stale. Do not calculate totals, comparisons, averages or trends and do not evaluate formulas: return insufficient_context for questions requiring calculation. Describe only values and statements actually present in the supplied cells. Header selection is provisional; merged cells and separate blocks must not be treated as independent records."
         deadline = time.monotonic() + min(valves.RUN_TIMEOUT_SECONDS, 180)
         answer = None
         qa_valves = valves.model_copy(
@@ -2992,7 +3650,7 @@ class Pipe:
             source_units = {u["id"]: u for u in context["units"]}
             for uid in cited:
                 unit = source_units[uid]
-                name = f"{snapshot['filename']} · {context['section']} · {uid}"
+                name = f"{snapshot['filename']} · {context['section']} · {unit.get('source_range', uid)}"
                 await emitter(
                     {
                         "type": "citation",
@@ -3006,6 +3664,11 @@ class Pipe:
                                     **self._citation_origin(snapshot),
                                     "passage_id": unit["passage"],
                                     "source_unit_id": uid,
+                                    **(
+                                        {"source_range": unit["source_range"]}
+                                        if "source_range" in unit
+                                        else {}
+                                    ),
                                 }
                             ],
                         },
@@ -3111,9 +3774,10 @@ class Pipe:
             snapshot["source_origin"] = origin
             snapshot["reader_chat_id"] = chat_id
             snapshot["reader_message_id"] = metadata["message_id"]
-            snapshot["source_sha256"] = hashlib.sha256(
-                source.encode("utf-8")
-            ).hexdigest()
+            if isinstance(source, str):
+                snapshot["source_sha256"] = hashlib.sha256(
+                    source.encode("utf-8")
+                ).hexdigest()
             snapshot["resume_scope"] = hashlib.sha256(
                 f"{user.id}:{chat_id}".encode("utf-8")
             ).hexdigest()
